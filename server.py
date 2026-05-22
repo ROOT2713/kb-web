@@ -711,8 +711,29 @@ async def query(q: str = Form(...), bank: str = Form("all")):
     else:
         db.close()
 
-    # 始终从 kb bank 召回，提高 limit 以增加覆盖
-    raw_results = await recall(q, limit=30, bank="kb")
+    # 从 kb bank 召回历史数据 + 目标 bank 召回新数据
+    raw_results = await recall(q, limit=25, bank="kb")
+    
+    # 同时查目标 bank（新上传的数据在各 bank 中）
+    if bank != "all":
+        target_bank = bank_cfg["hindsight"]
+        if target_bank != "kb":
+            try:
+                target_results = await recall(q, limit=8, bank=target_bank)
+                # 目标 bank 结果排在前面
+                raw_results = target_results + raw_results
+            except Exception:
+                pass  # 目标 bank 可能为空或不存在
+    else:
+        # "全部"模式：并行查所有有数据的 bank
+        try:
+            tasks = [recall(q, limit=3, bank=b) for b in ["proposals", "assessment", "projects"]]
+            extra_lists = await asyncio.gather(*tasks, return_exceptions=True)
+            for el in extra_lists:
+                if isinstance(el, list):
+                    raw_results = el + raw_results
+        except Exception:
+            pass
 
     # 精确结果排在最前面
     all_results = exact_results + raw_results
