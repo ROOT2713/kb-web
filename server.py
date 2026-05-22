@@ -141,7 +141,7 @@ def find_by_hash(content_hash: str) -> dict | None:
         return None
     db = get_db()
     row = db.execute(
-        "SELECT doc_id, title, category, filename, created_at FROM doc_meta WHERE content_hash = ? AND content_hash != ''",
+        "SELECT doc_id, title, category, filename, created_at FROM doc_meta WHERE content_hash = ? AND content_hash != '' AND bank != 'skip'",
         (content_hash,)
     ).fetchone()
     db.close()
@@ -1136,6 +1136,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div id="upload-result"></div>
   </div>
 
+  <div id="doc-search-bar" style="display:none;margin-bottom:12px">
+    <input id="doc-search" placeholder="🔍 搜索文档标题..." oninput="renderDocs()" style="width:100%;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none">
+  </div>
   <div class="doc-list" id="doc-list"></div>
 </div>
 
@@ -1225,7 +1228,10 @@ function toggleSection(name) {
     if (list.classList.contains('show')) {
       document.getElementById('upload-form').classList.remove('show');
       document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('doc-search-bar').style.display = 'block';
       loadDocs();
+    } else {
+      document.getElementById('doc-search-bar').style.display = 'none';
     }
   }
 }
@@ -1302,7 +1308,12 @@ function renderDocs() {
   if (!allDocs.length) {
     list.innerHTML = '<div class="empty">暂无文档</div>'; return;
   }
-  list.innerHTML = allDocs.map(doc => {
+  const q = (document.getElementById('doc-search').value || '').toLowerCase();
+  const filtered = q ? allDocs.filter(d => d.title.toLowerCase().includes(q) || (d.filename||'').toLowerCase().includes(q)) : allDocs;
+  if (!filtered.length) {
+    list.innerHTML = '<div class="empty">无匹配文档</div>'; return;
+  }
+  list.innerHTML = filtered.map(doc => {
     const catHtml = doc.category ? `<span class="cat-tag">${doc.category}</span>` : '';
     const dateStr = doc.created ? new Date(doc.created).toLocaleDateString('zh-CN') : '-';
     const bankOpts = bankData.filter(b => b.key !== 'all').map(b =>
