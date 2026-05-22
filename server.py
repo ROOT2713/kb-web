@@ -4,7 +4,7 @@
 文档上传 → 自动切片入库 → 自然语言搜索 → AI 合成答案
 v2: 增加标题/分类系统，本地 SQLite 存储文档元数据
 """
-import os, sys, json, re, uuid, sqlite3, subprocess, tempfile, shutil, traceback, hashlib
+import os, sys, json, re, uuid, sqlite3, subprocess, tempfile, shutil, traceback, hashlib, asyncio
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -344,6 +344,37 @@ async def mineru_parse_pdf(filename: str, content: bytes) -> str:
     return result
 
 
+async def docx_to_pdf_via_libreoffice(filename: str, content: bytes) -> bytes:
+    """用 LibreOffice headless 将 DOCX 转为 PDF，返回 PDF 字节"""
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="kb_docx2pdf_")
+    try:
+        docx_path = os.path.join(tmpdir, filename)
+        with open(docx_path, "wb") as f:
+            f.write(content)
+        
+        proc = await asyncio.create_subprocess_exec(
+            "libreoffice", "--headless", "--convert-to", "pdf",
+            "--outdir", tmpdir, docx_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        
+        if proc.returncode != 0:
+            raise RuntimeError(f"LibreOffice 退出码 {proc.returncode}: {stderr.decode()[:200]}")
+        
+        pdf_name = os.path.splitext(filename)[0] + ".pdf"
+        pdf_path = os.path.join(tmpdir, pdf_name)
+        if not os.path.exists(pdf_path):
+            raise RuntimeError(f"PDF 未生成: {pdf_path}")
+        
+        with open(pdf_path, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 async def _asleep(seconds: float):
     """异步 sleep，兼容 Python 3.11-"""
     import asyncio
@@ -400,7 +431,27 @@ async def parse_document(filename: str, content: bytes) -> str:
             d = docx.Document(BytesIO(content))
         except Exception as e:
             raise ValueError(f"Word 文档解析失败: {e}")
-        return "\n\n".join(p.text for p in d.paragraphs)
+        text = "\n\n".join(p.text for p in d.paragraphs)
+        # 同时提取表格文本
+        for table in d.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text for cell in row.cells if cell.text.strip())
+                if row_text.strip():
+                    text += "\n" + row_text
+        if text.strip():
+            return text
+        # python-docx 解析为空（纯表格/文本框等）→ 转 PDF 再解析
+        print(f"DOCX 段落+表格解析为空，尝试 LibreOffice 转 PDF: {filename}", file=sys.stderr)
+        try:
+            pdf_bytes = await docx_to_pdf_via_libreoffice(filename, content)
+            if pdf_bytes:
+                return await parse_document(
+                    filename.replace(".docx", ".pdf").replace(".doc", ".pdf"),
+                    pdf_bytes
+                )
+        except Exception as e:
+            print(f"LibreOffice 转换失败: {e}", file=sys.stderr)
+        raise ValueError("Word 文档内容为空，且自动转 PDF 也未能提取内容。请检查文件是否包含可读文字。")
     elif ext in (".md", ".markdown", ".txt", ".text", ""):
         return content.decode("utf-8", errors="replace")
     else:
