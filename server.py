@@ -693,75 +693,37 @@ async def query(q: str = Form(...), bank: str = Form("all")):
 
 @app.get("/api/documents")
 async def list_documents(bank: str = "all"):
-    """列出所有文档（含标题和分类）"""
-    # 始终从 kb bank 读取（所有历史数据都在 kb）
-    result = await hindsight_request(f"/v1/default/banks/kb/documents")
-    all_meta = get_all_meta()
-    
-    # 构建 doc_id → bank 映射（用于前端展示）
+    """列出文档（按 bank 过滤，数据来自 meta.db）"""
     db = get_db()
-    bank_map = {}
-    try:
-        rows = db.execute("SELECT doc_id, bank FROM doc_meta WHERE bank != 'kb'").fetchall()
-        bank_map = {r["doc_id"]: r["bank"] for r in rows}
-    except sqlite3.OperationalError:
-        pass
+    
+    if bank == "all":
+        rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank != 'skip' ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank = ? ORDER BY created_at DESC",
+            (bank,)
+        ).fetchall()
     db.close()
     
     docs = []
-    seen_titles = set()  # 去重
-    for item in result.get("items", []):
-        item_id = item["id"]
-        tags = item.get("tags", [])
-        
-        # 提取逻辑 doc_id
-        logical_doc_id = ""
-        for t in tags:
-            if t.startswith("doc_id:"):
-                logical_doc_id = t[7:]
-                break
-        
-        # 从 tags 提取 title
-        title = ""
-        for t in tags:
-            if t.startswith("title:"):
-                title = t[6:]
-                break
-        
-        # 回退到 meta
-        meta = all_meta.get(item_id, {})
-        if not title:
-            title = meta.get("title", "")
-        category = meta.get("category", "")
-        filename = meta.get("filename", "")
-        
-        if not filename:
-            for t in tags:
-                if t.startswith("doc:") and not t.startswith("doc_id:"):
-                    filename = t[4:]
-                    break
-        
-        if not title:
-            title = filename or "未知文档"
-        if not filename:
-            filename = "未知"
-        
+    seen = set()
+    for r in rows:
+        title = r["title"] or "未知文档"
         # 去重 by title
-        if title in seen_titles:
+        if title in seen:
             continue
-        seen_titles.add(title)
-        
-        doc_bank = bank_map.get(logical_doc_id, "") or bank_map.get(item_id, "")
-        
+        seen.add(title)
         docs.append({
-            "id": item_id,
+            "id": r["doc_id"],
             "title": title,
-            "category": category,
-            "filename": filename,
-            "chunks": item.get("memory_unit_count", 0),
-            "created": meta.get("created_at") or item.get("created_at", ""),
-            "size_chars": item.get("text_length", 0),
-            "bank": doc_bank or "kb",
+            "category": r["category"] or "",
+            "filename": r["filename"] or "",
+            "created": r["created_at"] or "",
+            "bank": r["bank"] or "kb",
+            "chunks": 0,
+            "size_chars": 0,
         })
     return {"documents": docs}
 
@@ -800,19 +762,19 @@ async def list_banks():
     db = get_db()
     bank_stats = {}
     try:
-        rows = db.execute("SELECT bank, COUNT(*) as cnt FROM doc_meta GROUP BY bank").fetchall()
+        rows = db.execute("SELECT bank, COUNT(*) as cnt FROM doc_meta WHERE bank != 'skip' GROUP BY bank").fetchall()
         bank_stats = {r["bank"]: r["cnt"] for r in rows}
     except sqlite3.OperationalError:
         pass
     db.close()
 
+    total = sum(bank_stats.values())
     banks = []
     for key, cfg in BANKS.items():
-        banks.append({
-            "key": key,
-            "name": cfg["name"],
-            "count": bank_stats.get(key, 0),
-        })
+        if key == "all":
+            banks.append({"key": key, "name": cfg["name"], "count": total})
+        else:
+            banks.append({"key": key, "name": cfg["name"], "count": bank_stats.get(key, 0)})
     return {"banks": banks}
 
 
