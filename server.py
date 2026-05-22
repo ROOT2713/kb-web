@@ -30,7 +30,15 @@ DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
 HINDSIGHT_URL = "http://localhost:8888"
-KB_BANK = "kb"
+KB_BANK = "kb"  # 默认 bank（兼容旧数据，"全部"查询时用）
+
+# ── 多 Bank 配置 ──
+BANKS = {
+    "all":     {"name": "全部",   "hindsight": "kb",         "prompt": "通用政务信息化知识库"},
+    "proposals":  {"name": "方案库", "hindsight": "proposals",  "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
+    "assessment": {"name": "测评库", "hindsight": "assessment", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
+    "projects":   {"name": "项目库", "hindsight": "projects",   "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
+}
 
 # MinerU API 配置
 MINERU_TOKEN = os.environ.get("MINERU_API_TOKEN", "")
@@ -448,14 +456,18 @@ async def hindsight_request(endpoint: str, method: str = "GET", json_data: dict 
         except Exception:
             raise Exception(f"Hindsight {method} {endpoint}: 响应不是有效 JSON: {resp.text[:200]}")
 
-async def recall(query: str, limit: int = 5) -> list:
-    """语义召回"""
+async def recall(query: str, limit: int = 5, bank: str = "kb") -> list:
+    """语义召回 — 支持指定 bank"""
     result = await hindsight_request(
-        f"/v1/default/banks/{KB_BANK}/memories/recall",
+        f"/v1/default/banks/{bank}/memories/recall",
         "POST",
         {"query": query, "max_tokens": 4096},
     )
     return result.get("results", [])
+
+def get_bank_config(bank_key: str) -> dict:
+    """获取 bank 配置，不存在则返回默认"""
+    return BANKS.get(bank_key, BANKS["all"])
 
 # ─── API ──────────────────────────────────────────────────────
 
@@ -464,10 +476,17 @@ async def upload(
     file: UploadFile = File(...),
     title: str = Form(""),
     category: str = Form(""),
+    bank: str = Form("kb"),
 ):
-    """上传文档 → 解析 → 切片 → 存入 Hindsight"""
+    """上传文档 → 解析 → 切片 → 存入 Hindsight（支持指定 bank）"""
     if not file.filename:
         raise HTTPException(400, "文件名不能为空")
+
+    # 验证 bank
+    bank_cfg = get_bank_config(bank)
+    if bank == "all":
+        bank = "kb"  # "全部"默认回到 kb
+    hs_bank = bank_cfg["hindsight"]
 
     content = await file.read()
     if len(content) == 0:
@@ -518,6 +537,7 @@ async def upload(
             f"chunk:{i+1}/{len(chunks)}",
             f"doc_id:{doc_id}",
             f"title:{doc_title}",
+            f"bank:{bank}",
         ]
         if doc_category:
             tags.append(f"cat:{doc_category}")
@@ -529,10 +549,10 @@ async def upload(
         # 超时按 chunk 数量动态计算：每 chunk 5s，最少 120s，最多 600s
         # 208 chunks 实测需要 ~408s，5s/chunk 给 2.5× 余量
         dyn_timeout = max(120, min(len(memory_items) * 5, 600))
-        print(f"Upload: {len(memory_items)} chunks, timeout={dyn_timeout}s", file=sys.stderr)
+        print(f"Upload: {len(memory_items)} chunks → bank={hs_bank}, timeout={dyn_timeout}s", file=sys.stderr)
         try:
             result = await hindsight_request(
-                f"/v1/default/banks/{KB_BANK}/memories",
+                f"/v1/default/banks/{hs_bank}/memories",
                 "POST",
                 {"items": memory_items},
                 timeout=dyn_timeout,
@@ -555,8 +575,13 @@ async def upload(
     if retained < len(memory_items):
         print(f"WARNING: Only {retained}/{len(memory_items)} chunks stored for doc {doc_id}", file=sys.stderr)
 
-    # 保存元数据到 SQLite
+    # 保存元数据到 SQLite（含 bank 字段）
     save_meta(doc_id, doc_title, doc_category, file.filename, content_hash)
+    # 同时记录 bank 到 meta.db
+    db = get_db()
+    db.execute("UPDATE doc_meta SET bank = ? WHERE doc_id = ?", (bank, doc_id))
+    db.commit()
+    db.close()
 
     return {
         "ok": True,
@@ -572,12 +597,33 @@ async def upload(
 
 
 @app.post("/api/query")
-async def query(q: str = Form(...)):
-    """搜索知识库 → 召回 → DeepSeek 合成答案"""
+async def query(q: str = Form(...), bank: str = Form("all")):
+    """搜索知识库 → 召回 → DeepSeek 合成答案（支持多 bank）"""
     if not q.strip():
         raise HTTPException(400, "问题不能为空")
 
-    results = await recall(q, limit=5)
+    bank_cfg = get_bank_config(bank)
+    hs_bank = bank_cfg["hindsight"]
+    bank_prompt = bank_cfg["prompt"]
+
+    if bank == "all":
+        # 全部模式：并行召回 kb + proposals + assessment + projects
+        import asyncio
+        all_banks = ["kb", "proposals", "assessment", "projects"]
+        tasks = [recall(q, limit=3, bank=b) for b in all_banks]
+        results_lists = await asyncio.gather(*tasks)
+        # 合并去重（按 text 相似度简单去重）
+        seen = set()
+        results = []
+        for rl in results_lists:
+            for r in rl:
+                text_key = (r.get("text","") or "")[:100]
+                if text_key not in seen:
+                    seen.add(text_key)
+                    results.append(r)
+        results = results[:8]  # 限制总数
+    else:
+        results = await recall(q, limit=5, bank=hs_bank)
 
     if not results:
         return {"answer": "知识库中未找到相关信息。", "sources": []}
@@ -593,24 +639,20 @@ async def query(q: str = Form(...)):
         doc_id = r.get("document_id", "")
         doc_name = "未知文档"
 
-        # 如果 document_id 为空，尝试从 tags 中提取
         if not doc_id:
             for tag in tags:
                 if tag.startswith("doc_id:"):
                     doc_id = tag[7:]
                     break
 
-        # 优先从 tags 中取 title
         for tag in tags:
             if tag.startswith("title:"):
                 doc_name = tag[6:]
                 break
-        # 回退：从 SQLite 中取
         if doc_name == "未知文档" and doc_id and doc_id in all_meta:
             meta_title = all_meta[doc_id].get("title", "")
             if meta_title and meta_title != "未知文档":
                 doc_name = meta_title
-        # 最后回退：从 tags 中取 doc:
         if doc_name == "未知文档":
             for tag in tags:
                 if tag.startswith("doc:") and not tag.startswith("doc_id:"):
@@ -627,7 +669,9 @@ async def query(q: str = Form(...)):
 
     context = "\n\n---\n\n".join(context_parts)
 
-    prompt = f"""基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。
+    prompt = f"""{bank_prompt}
+
+基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。
 
 文档内容：
 {context}
@@ -638,7 +682,8 @@ async def query(q: str = Form(...)):
 
     try:
         answer = await deepseek_chat([
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": bank_prompt},
+            {"role": "user", "content": prompt},
         ])
     except Exception as e:
         answer = f"答案生成失败: {e}"
@@ -647,51 +692,76 @@ async def query(q: str = Form(...)):
 
 
 @app.get("/api/documents")
-async def list_documents():
+async def list_documents(bank: str = "all"):
     """列出所有文档（含标题和分类）"""
-    result = await hindsight_request(f"/v1/default/banks/{KB_BANK}/documents")
+    # 始终从 kb bank 读取（所有历史数据都在 kb）
+    result = await hindsight_request(f"/v1/default/banks/kb/documents")
     all_meta = get_all_meta()
+    
+    # 构建 doc_id → bank 映射（用于前端展示）
+    db = get_db()
+    bank_map = {}
+    try:
+        rows = db.execute("SELECT doc_id, bank FROM doc_meta WHERE bank != 'kb'").fetchall()
+        bank_map = {r["doc_id"]: r["bank"] for r in rows}
+    except sqlite3.OperationalError:
+        pass
+    db.close()
+    
     docs = []
+    seen_titles = set()  # 去重
     for item in result.get("items", []):
-        doc_id = item["id"]
+        item_id = item["id"]
         tags = item.get("tags", [])
-
-        # 从 SQLite 获取元数据
-        meta = all_meta.get(doc_id, {})
-        title = meta.get("title", "")
+        
+        # 提取逻辑 doc_id
+        logical_doc_id = ""
+        for t in tags:
+            if t.startswith("doc_id:"):
+                logical_doc_id = t[7:]
+                break
+        
+        # 从 tags 提取 title
+        title = ""
+        for t in tags:
+            if t.startswith("title:"):
+                title = t[6:]
+                break
+        
+        # 回退到 meta
+        meta = all_meta.get(item_id, {})
+        if not title:
+            title = meta.get("title", "")
         category = meta.get("category", "")
         filename = meta.get("filename", "")
-
-        # 如果 meta 里没有，尝试从 tags 中提取（兼容旧数据）
-        if not title:
-            for t in tags:
-                if t.startswith("title:"):
-                    title = t[6:]
-                    break
+        
         if not filename:
             for t in tags:
                 if t.startswith("doc:") and not t.startswith("doc_id:"):
                     filename = t[4:]
                     break
-        if not category:
-            for t in tags:
-                if t.startswith("cat:"):
-                    category = t[4:]
-                    break
-
+        
         if not title:
             title = filename or "未知文档"
         if not filename:
             filename = "未知"
-
+        
+        # 去重 by title
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        
+        doc_bank = bank_map.get(logical_doc_id, "") or bank_map.get(item_id, "")
+        
         docs.append({
-            "id": doc_id,
+            "id": item_id,
             "title": title,
             "category": category,
             "filename": filename,
             "chunks": item.get("memory_unit_count", 0),
             "created": meta.get("created_at") or item.get("created_at", ""),
             "size_chars": item.get("text_length", 0),
+            "bank": doc_bank or "kb",
         })
     return {"documents": docs}
 
@@ -718,11 +788,32 @@ async def list_categories():
     result = []
     for cat in DEFAULT_CATEGORIES:
         result.append({"name": cat, "count": used.get(cat, 0)})
-    # 追加其他自定义分类
     for cat, cnt in used.items():
         if cat not in DEFAULT_CATEGORIES:
             result.append({"name": cat, "count": cnt})
     return {"categories": result}
+
+
+@app.get("/api/banks")
+async def list_banks():
+    """列出所有 bank 及文档统计"""
+    db = get_db()
+    bank_stats = {}
+    try:
+        rows = db.execute("SELECT bank, COUNT(*) as cnt FROM doc_meta GROUP BY bank").fetchall()
+        bank_stats = {r["bank"]: r["cnt"] for r in rows}
+    except sqlite3.OperationalError:
+        pass
+    db.close()
+
+    banks = []
+    for key, cfg in BANKS.items():
+        banks.append({
+            "key": key,
+            "name": cfg["name"],
+            "count": bank_stats.get(key, 0),
+        })
+    return {"banks": banks}
 
 
 @app.get("/api/stats")
@@ -895,27 +986,39 @@ INDEX_HTML = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#222;min-height:100vh}
-.header{background:#1a1a2e;color:#fff;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
-.header h1{font-size:18px;font-weight:600}
-.stats{font-size:13px;color:#aab;display:flex;gap:16px}
-.tabs{display:flex;background:#fff;border-bottom:1px solid #e0e0e0}
-.tab{flex:1;text-align:center;padding:14px;font-size:14px;cursor:pointer;border-bottom:2px solid transparent;color:#888}
-.tab.active{border-bottom-color:#e94560;color:#e94560;font-weight:600}
-.panel{display:none;padding:20px;max-width:900px;margin:0 auto}
-.panel.active{display:block}
-.search-box{display:flex;gap:8px;margin-bottom:20px}
-.search-box input{flex:1;padding:12px 16px;border:1px solid #ddd;border-radius:8px;font-size:15px}
-.search-box button{padding:12px 24px;background:#e94560;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer}
+.header{background:#1a1a2e;color:#fff;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
+.header h1{font-size:17px;font-weight:600}
+.stats{font-size:12px;color:#aab;display:flex;gap:14px}
+.bank-tabs{display:flex;background:#fff;border-bottom:1px solid #e0e0e0;padding:0 12px}
+.bank-tab{flex:1;text-align:center;padding:12px 8px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;color:#888;transition:.2s;white-space:nowrap}
+.bank-tab:hover{color:#444}
+.bank-tab.active{border-bottom-color:#e94560;color:#e94560;font-weight:600}
+.bank-tab .count{font-size:11px;color:#bbb;margin-left:2px}
+.bank-tab.active .count{color:#e94560}
+.main-area{max-width:900px;margin:0 auto;padding:20px}
+.search-box{display:flex;gap:8px;margin-bottom:16px}
+.search-box input{flex:1;padding:12px 16px;border:1px solid #ddd;border-radius:8px;font-size:15px;outline:none}
+.search-box input:focus{border-color:#e94560}
+.search-box button{padding:12px 24px;background:#e94560;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer;font-weight:600}
 .search-box button:hover{background:#d63850}
-.answer{background:#fff;border-radius:8px;padding:20px;line-height:1.8;font-size:15px;margin-bottom:16px}
+.answer{background:#fff;border-radius:10px;padding:20px;line-height:1.8;font-size:15px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.answer .bank-label{display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;margin-bottom:10px;color:#fff}
+.answer .bank-label.all{background:#666}
+.answer .bank-label.proposals{background:#4a90d9}
+.answer .bank-label.assessment{background:#e67e22}
+.answer .bank-label.projects{background:#27ae60}
 .sources{margin-top:16px;padding-top:12px;border-top:1px solid #eee}
 .source{background:#f8f8f8;border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:13px}
 .source .doc{color:#e94560;font-weight:600;margin-bottom:4px}
 .source .text{color:#666;line-height:1.6}
-.upload-form{background:#fff;border-radius:12px;padding:24px}
-.form-group{margin-bottom:16px}
+.section-bar{display:flex;gap:8px;margin-bottom:16px;align-items:center}
+.section-btn{padding:8px 16px;border-radius:6px;font-size:13px;cursor:pointer;border:1px solid #ddd;background:#fff;color:#666;transition:.2s}
+.section-btn:hover,.section-btn.active{border-color:#e94560;color:#e94560}
+.upload-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.upload-form.show{display:block}
+.form-group{margin-bottom:14px}
 .form-group label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px}
-.form-group input,.form-group select{width:100%;padding:12px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+.form-group input,.form-group select{width:100%;padding:12px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none}
 .form-group select{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E") no-repeat right 14px center;padding-right:36px}
 .upload-zone{border:2px dashed #ccc;border-radius:12px;padding:30px;text-align:center;cursor:pointer;transition:.2s;margin-bottom:16px}
 .upload-zone:hover,.upload-zone.dragover{border-color:#e94560;background:#fff5f5}
@@ -929,36 +1032,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .result-msg{margin-top:12px;padding:12px;border-radius:6px;font-size:14px}
 .result-msg.success{background:#e8f5e9;color:#2e7d32}
 .result-msg.error{background:#ffebee;color:#c62828}
-.filter-bar{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.filter-chip{padding:6px 14px;border-radius:20px;font-size:13px;cursor:pointer;border:1px solid #ddd;background:#fff;color:#666;transition:.2s}
-.filter-chip:hover,.filter-chip.active{border-color:#e94560;color:#e94560;background:#fff5f5}
-.doc-list{background:#fff;border-radius:8px}
+.doc-list{background:#fff;border-radius:10px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.doc-list.show{display:block}
 .doc-item{display:flex;justify-content:space-between;align-items:flex-start;padding:14px 16px;border-bottom:1px solid #f0f0f0;gap:12px}
 .doc-item:last-child{border-bottom:none}
 .doc-item .main{flex:1;min-width:0}
 .doc-item .title-line{display:flex;align-items:center;gap:8px;margin-bottom:4px}
-.doc-item .title{font-weight:600;font-size:14px;cursor:pointer;color:#222}
-.doc-item .title:hover{color:#e94560}
+.doc-item .title{font-weight:600;font-size:14px;color:#222}
 .doc-item .cat-tag{padding:2px 8px;border-radius:10px;font-size:11px;background:#f0f0f0;color:#888;white-space:nowrap}
 .doc-item .meta{color:#999;font-size:12px}
-.doc-item .actions{display:flex;gap:8px;flex-shrink:0}
+.doc-item .actions{display:flex;gap:6px;flex-shrink:0}
 .doc-item .actions span{cursor:pointer;padding:4px 8px;border-radius:4px;font-size:13px}
-.doc-item .edit{color:#555}
-.doc-item .edit:hover{background:#f0f0f0}
 .doc-item .del{color:#c62828}
 .doc-item .del:hover{background:#ffebee}
 .loading{text-align:center;padding:20px;color:#999}
 .empty{text-align:center;padding:40px;color:#bbb;font-size:14px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#e94560;border-radius:50%;animation:spin .6s linear infinite;margin-right:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;z-index:100}
-.modal{background:#fff;border-radius:12px;padding:24px;width:420px;max-width:90vw}
-.modal h3{margin-bottom:16px;font-size:16px}
-.modal .form-group{margin-bottom:14px}
-.modal .btn-row{display:flex;gap:8px;justify-content:flex-end}
-.modal .btn-row button{padding:10px 20px;border-radius:8px;font-size:14px;cursor:pointer;border:none}
-.modal .btn-save{background:#e94560;color:#fff}
-.modal .btn-cancel{background:#f0f0f0;color:#555}
 </style>
 </head>
 <body>
@@ -966,33 +1056,33 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <h1>📚 知识库</h1>
   <div class="stats" id="stats">加载中...</div>
 </div>
-<div class="tabs">
-  <div class="tab active" onclick="switchTab('search')">🔍 搜索</div>
-  <div class="tab" onclick="switchTab('upload')">📤 上传</div>
-  <div class="tab" onclick="switchTab('docs')">📋 文档</div>
+<div class="bank-tabs" id="bank-tabs">
+  <div class="bank-tab active" data-bank="all" onclick="switchBank('all')">🔍 全部<span class="count" id="cnt-all"></span></div>
+  <div class="bank-tab" data-bank="proposals" onclick="switchBank('proposals')">📋 方案库<span class="count" id="cnt-proposals"></span></div>
+  <div class="bank-tab" data-bank="assessment" onclick="switchBank('assessment')">📊 测评库<span class="count" id="cnt-assessment"></span></div>
+  <div class="bank-tab" data-bank="projects" onclick="switchBank('projects')">📁 项目库<span class="count" id="cnt-projects"></span></div>
 </div>
 
-<!-- 搜索 -->
-<div class="panel active" id="search-panel">
+<div class="main-area">
   <div class="search-box">
-    <input id="query" placeholder="输入问题，从知识库中搜索答案..." onkeydown="if(event.key==='Enter')doSearch()">
+    <input id="query" placeholder="输入问题搜索知识库..." onkeydown="if(event.key==='Enter')doSearch()">
     <button onclick="doSearch()">搜索</button>
   </div>
   <div id="answer-area"></div>
-</div>
 
-<!-- 上传 -->
-<div class="panel" id="upload-panel">
-  <div class="upload-form">
+  <div class="section-bar">
+    <button class="section-btn active" id="btn-upload" onclick="toggleSection('upload')">📤 上传文档</button>
+    <button class="section-btn" id="btn-docs" onclick="toggleSection('docs')">📋 文档列表</button>
+  </div>
+
+  <div class="upload-form" id="upload-form">
     <div class="form-group">
       <label>📌 文档标题 <span style="color:#999;font-weight:400">（可选，默认使用文件名）</span></label>
       <input id="upload-title" placeholder="输入文档标题...">
     </div>
     <div class="form-group">
       <label>📂 分类</label>
-      <select id="upload-category">
-        <option value="">-- 未分类 --</option>
-      </select>
+      <select id="upload-category"><option value="">-- 未分类 --</option></select>
     </div>
     <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <div class="icon">📄</div>
@@ -1002,42 +1092,58 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <button class="upload-btn" id="upload-btn" disabled onclick="doUpload()">上传到知识库</button>
     <div id="upload-result"></div>
   </div>
-</div>
 
-<!-- 文档列表 -->
-<div class="panel" id="docs-panel">
-  <div class="filter-bar" id="filter-bar"></div>
-  <div id="doc-list"></div>
+  <div class="doc-list" id="doc-list"></div>
 </div>
-
-<div id="modal-container"></div>
 
 <script>
+let currentBank = 'all';
 let selectedFile = null;
-let currentCatFilter = '';
 let allDocs = [];
+let bankData = [];
 
-// Tab 切换
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  event.target.classList.add('active');
-  document.getElementById(name+'-panel').classList.add('active');
-  if (name === 'docs') loadDocs();
-  if (name === 'upload') loadCategories();
+async function init() {
+  await loadBanks();
+  await loadCategories();
+  loadStats();
+}
+init();
+
+async function loadBanks() {
+  try {
+    const r = await fetch('/api/banks');
+    bankData = (await r.json()).banks;
+    bankData.forEach(b => {
+      const el = document.getElementById('cnt-'+b.key);
+      if (el) el.textContent = b.count ? ' ('+b.count+')' : '';
+    });
+  } catch(e) {}
 }
 
-// 搜索
+function switchBank(bank) {
+  currentBank = bank;
+  document.querySelectorAll('.bank-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-bank="'+bank+'"]').classList.add('active');
+  document.getElementById('answer-area').innerHTML = '';
+  document.getElementById('query').value = '';
+  document.getElementById('query').focus();
+  if (document.getElementById('doc-list').classList.contains('show')) {
+    loadDocs();
+  }
+}
+
 async function doSearch() {
   const q = document.getElementById('query').value.trim();
   if (!q) return;
   const area = document.getElementById('answer-area');
   area.innerHTML = '<div class="loading"><span class="spin"></span>搜索中...</div>';
+  
   try {
-    const fd = new FormData(); fd.append('q', q);
+    const fd = new FormData(); fd.append('q', q); fd.append('bank', currentBank);
     const r = await fetch('/api/query', {method:'POST', body:fd});
     const d = await r.json();
-    let html = '<div class="answer">' + d.answer.replace(/\\n/g,'<br>') + '</div>';
+    const labels = {'all':'全部','proposals':'方案库','assessment':'测评库','projects':'项目库'};
+    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+labels[currentBank]+'</span><br>' + d.answer.replace(/\\n/g,'<br>') + '</div>';
     if (d.sources && d.sources.length) {
       html += '<div class="sources"><strong>📎 参考来源</strong></div>';
       d.sources.forEach(s => {
@@ -1050,81 +1156,87 @@ async function doSearch() {
   }
 }
 
-// 文件选择（不自动上传）
+function toggleSection(name) {
+  if (name === 'upload') {
+    const form = document.getElementById('upload-form');
+    form.classList.toggle('show');
+    document.getElementById('btn-upload').classList.toggle('active', form.classList.contains('show'));
+    if (form.classList.contains('show')) {
+      document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('btn-docs').classList.remove('active');
+    }
+  } else {
+    const list = document.getElementById('doc-list');
+    list.classList.toggle('show');
+    document.getElementById('btn-docs').classList.toggle('active', list.classList.contains('show'));
+    if (list.classList.contains('show')) {
+      document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('btn-upload').classList.remove('active');
+      loadDocs();
+    }
+  }
+}
+
 function onFileSelected(file) {
   if (!file) return;
   selectedFile = file;
   document.getElementById('drop-hint').innerHTML = `<span class="file-selected">📎 ${file.name}</span><br><small style="color:#999">${(file.size/1024).toFixed(1)} KB</small>`;
   document.getElementById('upload-btn').disabled = false;
-  // 自动填充标题
   const titleInput = document.getElementById('upload-title');
-  if (!titleInput.value) {
-    titleInput.value = file.name.replace(/\\.[^.]+$/, '');
-  }
+  if (!titleInput.value) titleInput.value = file.name.replace(/\\.[^.]+$/, '');
 }
 
-// 上传
 async function doUpload() {
   if (!selectedFile) return;
   const btn = document.getElementById('upload-btn');
   const resultDiv = document.getElementById('upload-result');
-  btn.disabled = true;
-  btn.textContent = '上传中...';
+  btn.disabled = true; btn.textContent = '上传中...';
   resultDiv.innerHTML = '';
 
-  // 大文件耗时提示（10 秒后显示）
   const slowTimer = setTimeout(() => {
-    resultDiv.innerHTML = '<div class="result-msg" style="background:#fff3e0;color:#e65100">⏳ 处理中...扫描件 PDF 会进行 OCR 识别，可能需要数十秒，请耐心等待</div>';
+    resultDiv.innerHTML = '<div class="result-msg" style="background:#fff3e0;color:#e65100">⏳ 处理中...扫描件 PDF 会进行 OCR 识别，可能需要数十秒</div>';
   }, 10000);
 
   const fd = new FormData();
   fd.append('file', selectedFile);
   fd.append('title', document.getElementById('upload-title').value.trim());
   fd.append('category', document.getElementById('upload-category').value);
+  fd.append('bank', currentBank === 'all' ? 'kb' : currentBank);
+  
   try {
     const r = await fetch('/api/upload', {method:'POST', body:fd});
     clearTimeout(slowTimer);
     const d = await r.json();
     if (r.status === 409) {
-      // 重复文档：黄色警告，不清除文件选择
-      resultDiv.innerHTML =
-        '<div class=\"result-msg\" style=\"background:#fff3e0;color:#e65100;white-space:pre-line\">⚠️ ' + (d.detail || '文档已存在') + '</div>';
-      btn.disabled = false;
-      btn.textContent = '上传到知识库';
-      return;
+      resultDiv.innerHTML = '<div class="result-msg" style="background:#fff3e0;color:#e65100;white-space:pre-line">⚠️ ' + (d.detail || '文档已存在') + '</div>';
+      btn.disabled = false; btn.textContent = '上传到知识库'; return;
     }
     if (d.ok) {
       let msg = `<div class="result-msg success">✅ <b>${d.title}</b> 已入库 · ${d.chunks} 个片段 · ${d.total_chars} 字符<br><small>预览: ${d.preview}</small>`;
-      if (d.warning) {
-        msg += `<br><small style="color:#e67e22">⚠️ ${d.warning}</small>`;
-      }
+      if (d.warning) msg += `<br><small style="color:#e67e22">⚠️ ${d.warning}</small>`;
       msg += '</div>';
       resultDiv.innerHTML = msg;
       selectedFile = null;
       document.getElementById('upload-title').value = '';
       document.getElementById('drop-hint').innerHTML = '点击或拖拽上传文档<br>支持 PDF / Word / Markdown / TXT';
-      loadStats();
+      loadStats(); loadBanks();
     } else {
-      resultDiv.innerHTML =
-        '<div class="result-msg error">❌ 上传失败' + (d.detail ? ': ' + d.detail : '') + '</div>';
+      resultDiv.innerHTML = '<div class="result-msg error">❌ 上传失败' + (d.detail ? ': ' + d.detail : '') + '</div>';
     }
   } catch(e) {
     clearTimeout(slowTimer);
-    resultDiv.innerHTML = '<div class="result-msg error">上传失败: ' + (e.message === 'Failed to fetch' ? '网络超时或服务未响应，请稍后重试' : e.message) + '</div>';
+    resultDiv.innerHTML = '<div class="result-msg error">上传失败: ' + (e.message === 'Failed to fetch' ? '网络超时或服务未响应' : e.message) + '</div>';
   }
-  btn.disabled = false;
-  btn.textContent = '上传到知识库';
+  btn.disabled = false; btn.textContent = '上传到知识库';
 }
 
-// 加载文档列表
 async function loadDocs() {
   const list = document.getElementById('doc-list');
   list.innerHTML = '<div class="loading"><span class="spin"></span>加载中...</div>';
   try {
-    const r = await fetch('/api/documents');
+    const r = await fetch('/api/documents?bank=' + currentBank);
     const d = await r.json();
     allDocs = d.documents;
-    loadCategories(); // 更新筛选栏
     renderDocs();
   } catch(e) {
     list.innerHTML = '<div class="result-msg error">加载失败</div>';
@@ -1133,153 +1245,64 @@ async function loadDocs() {
 
 function renderDocs() {
   const list = document.getElementById('doc-list');
-  let docs = allDocs;
-  if (currentCatFilter) {
-    docs = docs.filter(d => d.category === currentCatFilter);
+  if (!allDocs.length) {
+    list.innerHTML = '<div class="empty">暂无文档</div>'; return;
   }
-  if (!docs.length) {
-    list.innerHTML = '<div class="empty">暂无文档</div>';
-    return;
-  }
-  list.innerHTML = docs.map(doc => {
-    const catHtml = doc.category
-      ? `<span class="cat-tag" onclick="event.stopPropagation();filterByCat('${doc.category}')">${doc.category}</span>`
-      : '';
+  list.innerHTML = allDocs.map(doc => {
+    const catHtml = doc.category ? `<span class="cat-tag">${doc.category}</span>` : '';
     const dateStr = doc.created ? new Date(doc.created).toLocaleDateString('zh-CN') : '-';
+    const bankTag = doc.bank && doc.bank !== 'kb' ? ` · <span style="color:#888;font-size:11px">${doc.bank}</span>` : '';
     return `<div class="doc-item">
       <div class="main">
         <div class="title-line">
-          <span class="title" title="${doc.filename}">📄 ${doc.title}</span>
-          ${catHtml}
+          <span class="title">📄 ${doc.title}</span>${catHtml}
         </div>
-        <div class="meta">${doc.chunks} 片段 · ${doc.size_chars} 字符 · ${dateStr}</div>
+        <div class="meta">${doc.chunks} 片段 · ${doc.size_chars} 字符 · ${dateStr}${bankTag}</div>
       </div>
       <div class="actions">
-        <span class="edit" onclick="editDoc('${doc.id}','${doc.title.replace(/'/g,"\\'")}','${doc.category.replace(/'/g,"\\'")}')">✏️</span>
         <span class="del" onclick="delDoc('${doc.id}',this)">🗑</span>
       </div>
     </div>`;
   }).join('');
 }
 
-function filterByCat(cat) {
-  if (currentCatFilter === cat) {
-    currentCatFilter = '';
-  } else {
-    currentCatFilter = cat;
-  }
-  renderFilterBar();
-  renderDocs();
-}
-
-// 分类筛选栏
-let catData = [];
-async function loadCategories() {
-  try {
-    const r = await fetch('/api/categories');
-    catData = (await r.json()).categories;
-
-    // 填充上传下拉
-    const sel = document.getElementById('upload-category');
-    if (sel.options.length <= 1) {
-      catData.forEach(c => {
-        if (c.name !== '其他') {
-          sel.appendChild(new Option(c.name, c.name));
-        }
-      });
-      sel.appendChild(new Option('其他', '其他'));
-    }
-
-    // 渲染筛选栏
-    renderFilterBar();
-  } catch(e) {}
-}
-
-function renderFilterBar() {
-  const bar = document.getElementById('filter-bar');
-  let html = `<span class="filter-chip${currentCatFilter===''?' active':''}" onclick="filterByCat('')">全部 (${allDocs.length})</span>`;
-  catData.forEach(c => {
-    if (c.count > 0 || c.name === currentCatFilter) {
-      html += `<span class="filter-chip${currentCatFilter===c.name?' active':''}" onclick="filterByCat('${c.name}')">${c.name} (${c.count})</span>`;
-    }
-  });
-  bar.innerHTML = html;
-}
-
-// 编辑文档
-function editDoc(id, title, category) {
-  const container = document.getElementById('modal-container');
-  container.innerHTML = `<div class="modal-overlay" onclick="event.target===this&&closeModal()">
-    <div class="modal">
-      <h3>编辑文档</h3>
-      <div class="form-group">
-        <label>标题</label>
-        <input id="edit-title" value="${title}">
-      </div>
-      <div class="form-group">
-        <label>分类</label>
-        <select id="edit-category">
-          <option value="">-- 未分类 --</option>
-          ${catData.map(c => `<option value="${c.name}" ${c.name===category?'selected':''}>${c.name}</option>`).join('')}
-        </select>
-      </div>
-      <div class="btn-row">
-        <button class="btn-cancel" onclick="closeModal()">取消</button>
-        <button class="btn-save" onclick="saveEdit('${id}')">保存</button>
-      </div>
-    </div>
-  </div>`;
-}
-
-function closeModal() {
-  document.getElementById('modal-container').innerHTML = '';
-}
-
-async function saveEdit(id) {
-  const title = document.getElementById('edit-title').value.trim();
-  const category = document.getElementById('edit-category').value;
-  const fd = new FormData();
-  fd.append('title', title);
-  fd.append('category', category);
-  await fetch('/api/documents/'+id, {method:'PATCH', body:fd});
-  closeModal();
-  loadDocs();
-}
-
-// 删除文档
 async function delDoc(id, el) {
   if (!confirm('确认删除此文档及所有关联内容？')) return;
   await fetch('/api/documents/'+id, {method:'DELETE'});
   el.closest('.doc-item').remove();
   allDocs = allDocs.filter(d => d.id !== id);
-  renderFilterBar();
-  loadStats();
+  loadStats(); loadBanks();
 }
 
-// 统计
+let catData = [];
+async function loadCategories() {
+  try {
+    const r = await fetch('/api/categories');
+    catData = (await r.json()).categories;
+    const sel = document.getElementById('upload-category');
+    if (sel.options.length <= 1) {
+      catData.forEach(c => { if (c.name !== '其他') sel.appendChild(new Option(c.name, c.name)); });
+      sel.appendChild(new Option('其他', '其他'));
+    }
+  } catch(e) {}
+}
+
 async function loadStats() {
   try {
     const r = await fetch('/api/stats');
     const d = await r.json();
-    document.getElementById('stats').innerHTML =
-      `<span>📄 ${d.total_documents||0} 文档</span><span>🧩 ${d.total_nodes||0} 节点</span>`;
+    document.getElementById('stats').innerHTML = `<span>📄 ${d.total_documents||0} 文档</span><span>🧩 ${d.total_nodes||0} 节点</span>`;
   } catch(e) {}
 }
 
-// 拖拽上传
 const dropZone = document.getElementById('drop-zone');
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZone.classList.remove('dragover');
+  e.preventDefault(); dropZone.classList.remove('dragover');
   const file = e.dataTransfer.files[0];
-  if (file) {
-    onFileSelected(file);
-  }
+  if (file) onFileSelected(file);
 });
-
-loadStats();
 </script>
 </body>
 </html>"""
