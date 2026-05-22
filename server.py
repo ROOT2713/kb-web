@@ -1313,7 +1313,7 @@ function renderDocs() {
         <div class="title-line">
           <span class="title">📄 ${doc.title}</span>${catHtml}
         </div>
-        <div class="meta">${doc.chunks} 片段 · ${doc.size_chars} 字符 · ${dateStr}</div>
+        <div class="meta">${doc.chunks > 0 ? doc.chunks + ' 片段 · ' + doc.size_chars + ' 字符' : '—'} · ${dateStr}</div>
       </div>
       <div class="actions">
         <select class="doc-bank-select" onchange="changeDocBank('${doc.id}', this.value)" title="切换分类">${bankOpts}</select>
