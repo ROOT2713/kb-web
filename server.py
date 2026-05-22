@@ -34,10 +34,14 @@ KB_BANK = "kb"  # 默认 bank（兼容旧数据，"全部"查询时用）
 
 # ── 多 Bank 配置 ──
 BANKS = {
-    "all":     {"name": "全部",   "hindsight": "kb",         "prompt": "通用政务信息化知识库"},
-    "proposals":  {"name": "方案库", "hindsight": "proposals",  "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
-    "assessment": {"name": "测评库", "hindsight": "assessment", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
-    "projects":   {"name": "项目库", "hindsight": "projects",   "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
+    "all":        {"name": "全部",     "hindsight": "kb", "prompt": "通用政务信息化知识库"},
+    "tech":       {"name": "技术实践", "hindsight": "kb", "prompt": "你是软件开发技术专家。精通前端/后端/Agent/DevOps，回答注重实战经验和架构设计。"},
+    "security":   {"name": "安全研究", "hindsight": "kb", "prompt": "你是网络安全研究专家。精通渗透测试/漏洞分析/防御技术，回答注重技术细节和攻防思路。"},
+    "ai":         {"name": "AI探索",   "hindsight": "kb", "prompt": "你是AI技术专家。精通LLM/机器学习/模型训练，回答注重技术原理和实践经验。"},
+    "notes":      {"name": "综合笔记", "hindsight": "kb", "prompt": "你是知识管理助手。擅长整理归纳各类知识，回答清晰有条理。"},
+    "proposals":  {"name": "方案库",   "hindsight": "kb", "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
+    "assessment": {"name": "测评库",   "hindsight": "kb", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
+    "projects":   {"name": "项目库",   "hindsight": "kb", "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
 }
 
 # MinerU API 配置
@@ -633,16 +637,18 @@ async def query(q: str = Form(...), bank: str = Form("all")):
                 doc_id = t[7:]
                 break
         if not doc_id:
-            continue
-        
+            # 技术类 bank 的记忆缺少 doc_id tag，不能丢弃
+            if bank in ("tech", "security", "ai", "notes"):
+                doc_id = f"_notag_{id(r)}"  # 伪造唯一 ID 用于分组
+            else:
+                continue
         # 过滤 skip bank
         if bank_map.get(doc_id) == "skip":
             continue
-        
         # 过滤指定 bank
-        if bank != "all" and bank_map.get(doc_id) != bank:
+        if bank != "all" and bank_map.get(doc_id) and bank_map.get(doc_id) != bank:
             continue
-        
+
         # 提取文档名
         doc_name = "未知文档"
         for t in tags:
@@ -733,58 +739,51 @@ async def query(q: str = Form(...), bank: str = Form("all")):
 
 @app.get("/api/documents")
 async def list_documents(bank: str = "all"):
-    """列出文档（Hindsight 数据 + meta.db bank 过滤）"""
-    # 从 kb bank 查所有 Hindsight 文档
-    result = await hindsight_request(f"/v1/default/banks/kb/documents?limit=1000")
-    
-    # 从 meta.db 建 bank 映射（排除 kb 和 skip）
+    """列出文档（meta.db 为主，Hindsight 补充 chunk/size）"""
     db = get_db()
-    meta_rows = db.execute(
-        "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank NOT IN ('kb', 'skip')"
-    ).fetchall()
-    db.close()
-    meta_by_id = {r["doc_id"]: r for r in meta_rows}
     
-    # 按 doc_id tag 分组 Hindsight 文档
-    groups = {}  # doc_id → {total_chunks, total_size}
+    # 从 meta.db 查文档（源数据）
+    if bank == "all":
+        meta_rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank NOT IN ('skip') ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        meta_rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank = ? ORDER BY created_at DESC",
+            (bank,)
+        ).fetchall()
+    db.close()
+    
+    # 从 Hindsight 补充 chunk/size 数据
+    result = await hindsight_request(f"/v1/default/banks/kb/documents?limit=1000", timeout=15)
+    hs_stats = {}  # doc_id → {chunks, size}
     for item in result.get("items", []):
-        tags = item.get("tags", [])
         doc_id = None
-        for t in tags:
+        for t in item.get("tags", []):
             if t.startswith("doc_id:"):
                 doc_id = t[7:]
                 break
         if not doc_id:
             continue
-        
-        if doc_id not in groups:
-            groups[doc_id] = {"chunks": 0, "size": 0}
-        groups[doc_id]["chunks"] += 1
-        groups[doc_id]["size"] += item.get("text_length", 0)
+        if doc_id not in hs_stats:
+            hs_stats[doc_id] = {"chunks": 0, "size": 0}
+        hs_stats[doc_id]["chunks"] += 1
+        hs_stats[doc_id]["size"] += item.get("text_length", 0)
     
-    # 组装结果，按 bank 过滤
     docs = []
-    for doc_id, stats in groups.items():
-        meta = meta_by_id.get(doc_id)
-        if not meta:
-            continue
-        
-        doc_bank = meta["bank"] or "kb"
-        if bank != "all" and doc_bank != bank:
-            continue
-        
+    for r in meta_rows:
+        stats = hs_stats.get(r["doc_id"], {"chunks": 0, "size": 0})
         docs.append({
-            "id": doc_id,
-            "title": meta["title"] or "未知文档",
-            "category": meta["category"] or "",
-            "filename": meta["filename"] or "",
+            "id": r["doc_id"],
+            "title": r["title"] or "未知文档",
+            "category": r["category"] or "",
+            "filename": r["filename"] or "",
             "chunks": stats["chunks"],
             "size_chars": stats["size"],
-            "created": meta["created_at"] or "",
-            "bank": doc_bank,
+            "created": r["created_at"] or "",
+            "bank": r["bank"] or "kb",
         })
     
-    docs.sort(key=lambda d: d["created"], reverse=True)
     return {"documents": docs}
 
 
@@ -795,6 +794,22 @@ async def patch_document(doc_id: str, title: str = Form(None), category: str = F
         raise HTTPException(400, "至少需要提供 title 或 category")
     update_meta(doc_id, title=title, category=category)
     return {"ok": True, "doc_id": doc_id, "title": title, "category": category}
+
+
+@app.patch("/api/documents/{doc_id}/bank")
+async def patch_document_bank(doc_id: str, bank: str = Form(...)):
+    """切换文档所属 bank"""
+    if bank not in BANKS:
+        raise HTTPException(400, f"无效的 bank: {bank}，有效值: {', '.join(BANKS.keys())}")
+    db = get_db()
+    row = db.execute("SELECT doc_id FROM doc_meta WHERE doc_id = ?", (doc_id,)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, f"文档 {doc_id} 不存在")
+    db.execute("UPDATE doc_meta SET bank = ? WHERE doc_id = ?", (bank, doc_id))
+    db.commit()
+    db.close()
+    return {"ok": True, "doc_id": doc_id, "bank": bank}
 
 
 @app.get("/api/categories")
@@ -828,7 +843,7 @@ async def list_banks():
         pass
     db.close()
 
-    total = bank_stats.get("proposals", 0) + bank_stats.get("assessment", 0) + bank_stats.get("projects", 0)
+    total = sum(bank_stats.get(key, 0) for key in BANKS if key != "all")
     banks = []
     for key, cfg in BANKS.items():
         if key == "all":
@@ -1011,12 +1026,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .header{background:#1a1a2e;color:#fff;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
 .header h1{font-size:17px;font-weight:600}
 .stats{font-size:12px;color:#aab;display:flex;gap:14px}
-.bank-tabs{display:flex;background:#fff;border-bottom:1px solid #e0e0e0;padding:0 12px}
-.bank-tab{flex:1;text-align:center;padding:12px 8px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;color:#888;transition:.2s;white-space:nowrap}
-.bank-tab:hover{color:#444}
-.bank-tab.active{border-bottom-color:#e94560;color:#e94560;font-weight:600}
-.bank-tab .count{font-size:11px;color:#bbb;margin-left:2px}
-.bank-tab.active .count{color:#e94560}
+.bank-bar{display:flex;background:#fff;border-bottom:1px solid #e0e0e0;padding:8px 16px;align-items:center;gap:8px}
+.bank-bar label{font-size:12px;color:#888;white-space:nowrap}
+.bank-bar select{padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;outline:none;background:#fff;min-width:120px}
+.bank-bar select:focus{border-color:#e94560}
+.doc-bank-select{font-size:11px;padding:2px 4px;border:1px solid #ddd;border-radius:4px;background:#fff;color:#666;outline:none;max-width:80px}
+.doc-bank-select:focus{border-color:#e94560}
 .main-area{max-width:900px;margin:0 auto;padding:20px}
 .search-box{display:flex;gap:8px;margin-bottom:16px}
 .search-box input{flex:1;padding:12px 16px;border:1px solid #ddd;border-radius:8px;font-size:15px;outline:none}
@@ -1026,6 +1041,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .answer{background:#fff;border-radius:10px;padding:20px;line-height:1.8;font-size:15px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
 .answer .bank-label{display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;margin-bottom:10px;color:#fff}
 .answer .bank-label.all{background:#666}
+.answer .bank-label.tech{background:#8e44ad}
+.answer .bank-label.security{background:#c0392b}
+.answer .bank-label.ai{background:#2980b9}
+.answer .bank-label.notes{background:#16a085}
 .answer .bank-label.proposals{background:#4a90d9}
 .answer .bank-label.assessment{background:#e67e22}
 .answer .bank-label.projects{background:#27ae60}
@@ -1078,11 +1097,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <h1>📚 知识库</h1>
   <div class="stats" id="stats">加载中...</div>
 </div>
-<div class="bank-tabs" id="bank-tabs">
-  <div class="bank-tab active" data-bank="all" onclick="switchBank('all')">🔍 全部<span class="count" id="cnt-all"></span></div>
-  <div class="bank-tab" data-bank="proposals" onclick="switchBank('proposals')">📋 方案库<span class="count" id="cnt-proposals"></span></div>
-  <div class="bank-tab" data-bank="assessment" onclick="switchBank('assessment')">📊 测评库<span class="count" id="cnt-assessment"></span></div>
-  <div class="bank-tab" data-bank="projects" onclick="switchBank('projects')">📁 项目库<span class="count" id="cnt-projects"></span></div>
+<div class="bank-bar" id="bank-bar">
+  <label>📂 知识库分类：</label>
+  <select id="bank-selector" onchange="switchBank(this.value)"></select>
 </div>
 
 <div class="main-area">
@@ -1105,6 +1122,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div class="form-group">
       <label>📂 分类</label>
       <select id="upload-category"><option value="">-- 未分类 --</option></select>
+    </div>
+    <div class="form-group">
+      <label>🏷️ 知识库分类</label>
+      <select id="upload-bank"><option value="">-- 加载中 --</option></select>
     </div>
     <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <div class="icon">📄</div>
@@ -1135,17 +1156,27 @@ async function loadBanks() {
   try {
     const r = await fetch('/api/banks');
     bankData = (await r.json()).banks;
-    bankData.forEach(b => {
-      const el = document.getElementById('cnt-'+b.key);
-      if (el) el.textContent = b.count ? ' ('+b.count+')' : '';
-    });
+    // Populate main bank selector
+    const sel = document.getElementById('bank-selector');
+    sel.innerHTML = bankData.map(b => 
+      `<option value="${b.key}"${b.key === 'all' ? ' selected' : ''}>${b.name} (${b.count || 0})</option>`
+    ).join('');
+    // Populate upload bank selector
+    const upSel = document.getElementById('upload-bank');
+    upSel.innerHTML = '<option value="">-- 选择分类 --</option>' +
+      bankData.filter(b => b.key !== 'all').map(b =>
+        `<option value="${b.key}">${b.name} (${b.count || 0})</option>`
+      ).join('');
+    // Populate doc row bank dropdowns if visible
+    if (document.getElementById('doc-list').classList.contains('show')) {
+      populateDocBankSelects();
+    }
   } catch(e) {}
 }
 
 function switchBank(bank) {
   currentBank = bank;
-  document.querySelectorAll('.bank-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector('[data-bank="'+bank+'"]').classList.add('active');
+  document.getElementById('bank-selector').value = bank;
   document.getElementById('answer-area').innerHTML = '';
   document.getElementById('query').value = '';
   document.getElementById('query').focus();
@@ -1164,8 +1195,8 @@ async function doSearch() {
     const fd = new FormData(); fd.append('q', q); fd.append('bank', currentBank);
     const r = await fetch('/api/query', {method:'POST', body:fd});
     const d = await r.json();
-    const labels = {'all':'全部','proposals':'方案库','assessment':'测评库','projects':'项目库'};
-    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+labels[currentBank]+'</span><br>' + d.answer.replace(/\\n/g,'<br>') + '</div>';
+    const bankName = (bankData.find(b => b.key === currentBank) || {}).name || currentBank;
+    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+bankName+'</span><br>' + d.answer.replace(/\\n/g,'<br>') + '</div>';
     if (d.sources && d.sources.length) {
       html += '<div class="sources"><strong>📎 参考来源</strong></div>';
       d.sources.forEach(s => {
@@ -1223,7 +1254,8 @@ async function doUpload() {
   fd.append('file', selectedFile);
   fd.append('title', document.getElementById('upload-title').value.trim());
   fd.append('category', document.getElementById('upload-category').value);
-  fd.append('bank', currentBank === 'all' ? 'kb' : currentBank);
+  const uploadBank = document.getElementById('upload-bank').value;
+  fd.append('bank', uploadBank || (currentBank === 'all' ? 'kb' : currentBank));
   
   try {
     const r = await fetch('/api/upload', {method:'POST', body:fd});
@@ -1273,19 +1305,45 @@ function renderDocs() {
   list.innerHTML = allDocs.map(doc => {
     const catHtml = doc.category ? `<span class="cat-tag">${doc.category}</span>` : '';
     const dateStr = doc.created ? new Date(doc.created).toLocaleDateString('zh-CN') : '-';
-    const bankTag = doc.bank && doc.bank !== 'kb' ? ` · <span style="color:#888;font-size:11px">${doc.bank}</span>` : '';
-    return `<div class="doc-item">
+    const bankOpts = bankData.filter(b => b.key !== 'all').map(b =>
+      `<option value="${b.key}"${doc.bank === b.key ? ' selected' : ''}>${b.name}</option>`
+    ).join('');
+    return `<div class="doc-item" id="doc-row-${doc.id}">
       <div class="main">
         <div class="title-line">
           <span class="title">📄 ${doc.title}</span>${catHtml}
         </div>
-        <div class="meta">${doc.chunks} 片段 · ${doc.size_chars} 字符 · ${dateStr}${bankTag}</div>
+        <div class="meta">${doc.chunks} 片段 · ${doc.size_chars} 字符 · ${dateStr}</div>
       </div>
       <div class="actions">
+        <select class="doc-bank-select" onchange="changeDocBank('${doc.id}', this.value)" title="切换分类">${bankOpts}</select>
         <span class="del" onclick="delDoc('${doc.id}',this)">🗑</span>
       </div>
     </div>`;
   }).join('');
+}
+
+function populateDocBankSelects() {
+  document.querySelectorAll('.doc-bank-select').forEach(sel => {
+    const currentVal = sel.value;
+    sel.innerHTML = bankData.filter(b => b.key !== 'all').map(b =>
+      `<option value="${b.key}"${b.key === currentVal ? ' selected' : ''}>${b.name}</option>`
+    ).join('');
+  });
+}
+
+async function changeDocBank(docId, newBank) {
+  if (!newBank || newBank === 'all') return;
+  try {
+    const fd = new FormData(); fd.append('bank', newBank);
+    const r = await fetch('/api/documents/' + docId + '/bank', {method:'PATCH', body:fd});
+    if (r.ok) {
+      // Update local data
+      const doc = allDocs.find(d => d.id === docId);
+      if (doc) doc.bank = newBank;
+      loadBanks();
+    }
+  } catch(e) {}
 }
 
 async function delDoc(id, el) {
