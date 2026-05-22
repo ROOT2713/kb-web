@@ -35,13 +35,13 @@ KB_BANK = "kb"  # 默认 bank（兼容旧数据，"全部"查询时用）
 # ── 多 Bank 配置 ──
 BANKS = {
     "all":        {"name": "全部",     "hindsight": "kb", "prompt": "通用政务信息化知识库"},
-    "tech":       {"name": "技术实践", "hindsight": "kb", "prompt": "你是软件开发技术专家。精通前端/后端/Agent/DevOps，回答注重实战经验和架构设计。"},
-    "security":   {"name": "安全研究", "hindsight": "kb", "prompt": "你是网络安全研究专家。精通渗透测试/漏洞分析/防御技术，回答注重技术细节和攻防思路。"},
-    "ai":         {"name": "AI探索",   "hindsight": "kb", "prompt": "你是AI技术专家。精通LLM/机器学习/模型训练，回答注重技术原理和实践经验。"},
-    "notes":      {"name": "综合笔记", "hindsight": "kb", "prompt": "你是知识管理助手。擅长整理归纳各类知识，回答清晰有条理。"},
-    "proposals":  {"name": "方案库",   "hindsight": "kb", "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
-    "assessment": {"name": "测评库",   "hindsight": "kb", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
-    "projects":   {"name": "项目库",   "hindsight": "kb", "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
+    "tech":       {"name": "技术实践", "hindsight": "tech", "prompt": "你是软件开发技术专家。精通前端/后端/Agent/DevOps，回答注重实战经验和架构设计。"},
+    "security":   {"name": "安全研究", "hindsight": "security", "prompt": "你是网络安全研究专家。精通渗透测试/漏洞分析/防御技术，回答注重技术细节和攻防思路。"},
+    "ai":         {"name": "AI探索",   "hindsight": "ai", "prompt": "你是AI技术专家。精通LLM/机器学习/模型训练，回答注重技术原理和实践经验。"},
+    "notes":      {"name": "综合笔记", "hindsight": "notes", "prompt": "你是知识管理助手。擅长整理归纳各类知识，回答清晰有条理。"},
+    "proposals":  {"name": "方案库",   "hindsight": "proposals", "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
+    "assessment": {"name": "测评库",   "hindsight": "assessment", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
+    "projects":   {"name": "项目库",   "hindsight": "projects", "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
 }
 
 # MinerU API 配置
