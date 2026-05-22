@@ -603,27 +603,38 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         raise HTTPException(400, "问题不能为空")
 
     bank_cfg = get_bank_config(bank)
-    hs_bank = bank_cfg["hindsight"]
     bank_prompt = bank_cfg["prompt"]
 
-    if bank == "all":
-        # 全部模式：并行召回 kb + proposals + assessment + projects
-        import asyncio
-        all_banks = ["kb", "proposals", "assessment", "projects"]
-        tasks = [recall(q, limit=3, bank=b) for b in all_banks]
-        results_lists = await asyncio.gather(*tasks)
-        # 合并去重（按 text 相似度简单去重）
-        seen = set()
-        results = []
-        for rl in results_lists:
-            for r in rl:
-                text_key = (r.get("text","") or "")[:100]
-                if text_key not in seen:
-                    seen.add(text_key)
-                    results.append(r)
-        results = results[:8]  # 限制总数
+    # 构建 doc_id → bank 映射（用于过滤结果）
+    db = get_db()
+    bank_map = {}
+    try:
+        rows = db.execute("SELECT doc_id, bank FROM doc_meta").fetchall()
+        bank_map = {r["doc_id"]: r["bank"] for r in rows}
+    except sqlite3.OperationalError:
+        pass
+    db.close()
+
+    # 始终从 kb bank 召回（所有数据都在 kb）
+    results = await recall(q, limit=12, bank="kb")
+
+    # 按 bank 过滤结果
+    if bank != "all":
+        filtered = []
+        for r in results:
+            tags = r.get("tags", [])
+            doc_id = None
+            for t in tags:
+                if t.startswith("doc_id:"):
+                    doc_id = t[7:]
+                    break
+            if doc_id and bank_map.get(doc_id) == bank:
+                filtered.append(r)
+            elif r.get("document_id") and bank_map.get(r["document_id"]) == bank:
+                filtered.append(r)
+        results = filtered[:5]
     else:
-        results = await recall(q, limit=5, bank=hs_bank)
+        results = results[:5]
 
     if not results:
         return {"answer": "知识库中未找到相关信息。", "sources": []}
@@ -693,38 +704,58 @@ async def query(q: str = Form(...), bank: str = Form("all")):
 
 @app.get("/api/documents")
 async def list_documents(bank: str = "all"):
-    """列出文档（按 bank 过滤，数据来自 meta.db）"""
+    """列出文档（Hindsight 数据 + meta.db bank 过滤）"""
+    # 从 kb bank 查所有 Hindsight 文档
+    result = await hindsight_request(f"/v1/default/banks/kb/documents?limit=1000")
+    
+    # 从 meta.db 建 bank 映射
     db = get_db()
-    
-    if bank == "all":
-        rows = db.execute(
-            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank != 'skip' ORDER BY created_at DESC"
-        ).fetchall()
-    else:
-        rows = db.execute(
-            "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank = ? ORDER BY created_at DESC",
-            (bank,)
-        ).fetchall()
+    meta_rows = db.execute(
+        "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta"
+    ).fetchall()
     db.close()
+    meta_by_id = {r["doc_id"]: r for r in meta_rows}
     
-    docs = []
-    seen = set()
-    for r in rows:
-        title = r["title"] or "未知文档"
-        # 去重 by title
-        if title in seen:
+    # 按 doc_id tag 分组 Hindsight 文档
+    groups = {}  # doc_id → {total_chunks, total_size}
+    for item in result.get("items", []):
+        tags = item.get("tags", [])
+        doc_id = None
+        for t in tags:
+            if t.startswith("doc_id:"):
+                doc_id = t[7:]
+                break
+        if not doc_id:
             continue
-        seen.add(title)
+        
+        if doc_id not in groups:
+            groups[doc_id] = {"chunks": 0, "size": 0}
+        groups[doc_id]["chunks"] += 1
+        groups[doc_id]["size"] += item.get("text_length", 0)
+    
+    # 组装结果，按 bank 过滤
+    docs = []
+    for doc_id, stats in groups.items():
+        meta = meta_by_id.get(doc_id)
+        if not meta:
+            continue
+        
+        doc_bank = meta["bank"] or "kb"
+        if bank != "all" and doc_bank != bank:
+            continue
+        
         docs.append({
-            "id": r["doc_id"],
-            "title": title,
-            "category": r["category"] or "",
-            "filename": r["filename"] or "",
-            "created": r["created_at"] or "",
-            "bank": r["bank"] or "kb",
-            "chunks": 0,
-            "size_chars": 0,
+            "id": doc_id,
+            "title": meta["title"] or "未知文档",
+            "category": meta["category"] or "",
+            "filename": meta["filename"] or "",
+            "chunks": stats["chunks"],
+            "size_chars": stats["size"],
+            "created": meta["created_at"] or "",
+            "bank": doc_bank,
         })
+    
+    docs.sort(key=lambda d: d["created"], reverse=True)
     return {"documents": docs}
 
 
