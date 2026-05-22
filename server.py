@@ -617,16 +617,59 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         bank_map = {r["doc_id"]: r["bank"] for r in rows}
     except sqlite3.OperationalError:
         pass
-    db.close()
+
+    # ── 精确检索：关键词匹配 meta.db 标题 ──
+    import re
+    exact_results = []
+    # 提取查询中的标准号/文件号等精确标识符
+    patterns = [
+        r'GB/T\s*\d+[\.\-]\d+', r'GB\s*\d+[\.\-]\d+',
+        r'T/EGAG\s*\d+[\.\-]\d+', r'GDZW\s*\d+[\.\-]\d+',
+        r'粤府办〔\d+〕\d+号', r'穗政数〔\d+〕\d+号',
+        r'ISO\s*\d+', r'[\u4e00-\u9fff]+〔\d+〕\d+号',
+    ]
+    exact_terms = set()
+    for pat in patterns:
+        exact_terms.update(re.findall(pat, q))
+    
+    if exact_terms:
+        # 查 meta.db 标题匹配
+        title_rows = db.execute(
+            "SELECT doc_id, title FROM doc_meta WHERE " + " OR ".join(["title LIKE ?" for _ in exact_terms]),
+            [f"%{t}%" for t in exact_terms]
+        ).fetchall()
+        db.close()
+        
+        for tr in title_rows:
+            # 过滤 bank
+            if bank != "all" and bank_map.get(tr["doc_id"]) != bank:
+                continue
+            if bank_map.get(tr["doc_id"]) == "skip":
+                continue
+            # 用文档标题做定向召回
+            targeted = await recall(tr["title"], limit=2, bank="kb")
+            for r in targeted:
+                tags = r.get("tags", [])
+                doc_tag = None
+                for t in tags:
+                    if t.startswith("doc_id:"):
+                        doc_tag = t[7:]
+                        break
+                if doc_tag == tr["doc_id"]:
+                    exact_results.append(r)
+    else:
+        db.close()
 
     # 始终从 kb bank 召回，提高 limit 以增加覆盖
     raw_results = await recall(q, limit=30, bank="kb")
 
+    # 精确结果排在最前面
+    all_results = exact_results + raw_results
+
     # ── 清洗 + 过滤 + 去重合并 ──
-    import re
     doc_facts = {}  # doc_id → [(text, doc_name, cleaned_text), ...]
     
-    for r in raw_results:
+    for r in all_results:
         text = r.get("text", "") or ""
         tags = r.get("tags", [])
         
