@@ -408,7 +408,7 @@ def filename_to_title(filename: str) -> str:
 
 async def deepseek_chat(messages: list, stream: bool = False) -> str:
     """调用 DeepSeek Chat API"""
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{DEEPSEEK_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {DEEPSEEK_KEY}"},
@@ -416,10 +416,10 @@ async def deepseek_chat(messages: list, stream: bool = False) -> str:
                 "model": DEEPSEEK_MODEL,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 1500,
+                "max_tokens": 3000,
                 "stream": stream,
             },
-            timeout=60,
+            timeout=120,
         )
         if stream:
             return resp
@@ -615,81 +615,110 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         pass
     db.close()
 
-    # 始终从 kb bank 召回（所有数据都在 kb）
-    results = await recall(q, limit=12, bank="kb")
+    # 始终从 kb bank 召回，提高 limit 以增加覆盖
+    raw_results = await recall(q, limit=30, bank="kb")
 
-    # 按 bank 过滤结果
-    if bank != "all":
-        filtered = []
-        for r in results:
-            tags = r.get("tags", [])
-            doc_id = None
-            for t in tags:
-                if t.startswith("doc_id:"):
-                    doc_id = t[7:]
-                    break
-            if doc_id and bank_map.get(doc_id) == bank:
-                filtered.append(r)
-            elif r.get("document_id") and bank_map.get(r["document_id"]) == bank:
-                filtered.append(r)
-        results = filtered[:5]
-    else:
-        results = results[:5]
+    # ── 清洗 + 过滤 + 去重合并 ──
+    import re
+    doc_facts = {}  # doc_id → [(text, doc_name, cleaned_text), ...]
+    
+    for r in raw_results:
+        text = r.get("text", "") or ""
+        tags = r.get("tags", [])
+        
+        # 提取 doc_id
+        doc_id = None
+        for t in tags:
+            if t.startswith("doc_id:"):
+                doc_id = t[7:]
+                break
+        if not doc_id:
+            continue
+        
+        # 过滤 skip bank
+        if bank_map.get(doc_id) == "skip":
+            continue
+        
+        # 过滤指定 bank
+        if bank != "all" and bank_map.get(doc_id) != bank:
+            continue
+        
+        # 提取文档名
+        doc_name = "未知文档"
+        for t in tags:
+            if t.startswith("title:"):
+                doc_name = t[6:]
+                break
+        
+        # 清理 Hindsight 元数据（| When: ... | Involving: ...）
+        cleaned = re.sub(r'\s*\|\s*(When|Involving|Entities|Location|Type|Source):[^|]*', '', text).strip()
+        if not cleaned:
+            cleaned = text.strip()
+        
+        if doc_id not in doc_facts:
+            doc_facts[doc_id] = []
+        doc_facts[doc_id].append((text, doc_name, cleaned))
 
-    if not results:
+    if not doc_facts:
         return {"answer": "知识库中未找到相关信息。", "sources": []}
 
-    # 批量获取元数据
-    all_meta = get_all_meta()
-
+    # ── 按文档合并：每个文档取 top-2 fact，拼接 ──
     context_parts = []
     sources = []
-    for r in results:
-        text = r.get("text", "")
-        tags = r.get("tags", [])
-        doc_id = r.get("document_id", "")
-        doc_name = "未知文档"
-
-        if not doc_id:
-            for tag in tags:
-                if tag.startswith("doc_id:"):
-                    doc_id = tag[7:]
-                    break
-
-        for tag in tags:
-            if tag.startswith("title:"):
-                doc_name = tag[6:]
+    
+    for doc_id, facts in doc_facts.items():
+        # 取前 2 个 fact
+        top_facts = facts[:2]
+        doc_name = top_facts[0][1]
+        
+        # 合并同一文档的 fact（去重）
+        seen_texts = set()
+        merged = []
+        for _, _, cleaned in top_facts:
+            key = cleaned[:80]
+            if key not in seen_texts:
+                seen_texts.add(key)
+                merged.append(cleaned)
+        
+        if not merged:
+            continue
+        
+        combined = "；".join(merged)
+        context_parts.append(f"[来源: {doc_name}]\n{combined}")
+        
+        # 来源展示：取第一条的原文摘要
+        sources.append({
+            "doc": doc_name,
+            "chunk": f"{len(facts)} 条相关",
+            "text": facts[0][0][:200],
+        })
+    
+    # ── 限制 context 总量 ──
+    total_chars = sum(len(p) for p in context_parts)
+    if total_chars > 8000:
+        # 按序截断
+        kept = []
+        chars = 0
+        for p in context_parts:
+            if chars + len(p) > 8000:
                 break
-        if doc_name == "未知文档" and doc_id and doc_id in all_meta:
-            meta_title = all_meta[doc_id].get("title", "")
-            if meta_title and meta_title != "未知文档":
-                doc_name = meta_title
-        if doc_name == "未知文档":
-            for tag in tags:
-                if tag.startswith("doc:") and not tag.startswith("doc_id:"):
-                    doc_name = tag[4:]
-                    break
-
-        chunk_info = ""
-        for tag in tags:
-            if tag.startswith("chunk:"):
-                chunk_info = tag[6:]
-
-        context_parts.append(f"[来源: {doc_name} {chunk_info}]\n{text}")
-        sources.append({"doc": doc_name, "chunk": chunk_info, "text": text[:200]})
-
+            kept.append(p)
+            chars += len(p)
+        context_parts = kept
+    
     context = "\n\n---\n\n".join(context_parts)
+    sources = sources[:8]
 
     prompt = f"""{bank_prompt}
 
-基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。
+基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。回答尽量详细，引用具体条款和数据。
 
 文档内容：
 {context}
 
 问题：{q}
 
-请用中文回答，并在答案中标注信息来源。"""
+请用中文回答，并在答案中标注信息来源（文档名称）。"""
 
     try:
         answer = await deepseek_chat([
