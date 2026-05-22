@@ -737,10 +737,10 @@ async def list_documents(bank: str = "all"):
     # 从 kb bank 查所有 Hindsight 文档
     result = await hindsight_request(f"/v1/default/banks/kb/documents?limit=1000")
     
-    # 从 meta.db 建 bank 映射
+    # 从 meta.db 建 bank 映射（排除 kb 和 skip）
     db = get_db()
     meta_rows = db.execute(
-        "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta"
+        "SELECT doc_id, title, category, filename, bank, created_at FROM doc_meta WHERE bank NOT IN ('kb', 'skip')"
     ).fetchall()
     db.close()
     meta_by_id = {r["doc_id"]: r for r in meta_rows}
@@ -828,7 +828,7 @@ async def list_banks():
         pass
     db.close()
 
-    total = sum(bank_stats.values())
+    total = bank_stats.get("proposals", 0) + bank_stats.get("assessment", 0) + bank_stats.get("projects", 0)
     banks = []
     for key, cfg in BANKS.items():
         if key == "all":
