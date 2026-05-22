@@ -1,0 +1,17 @@
+[Unit]
+Description=知识库 Web 服务 (kb-web)
+Documentation=https://github.com/ROOT2713/kb-web
+After=network.target hindsight.service
+Wants=hindsight.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kb-web
+ExecStart=/home/ubuntu/kb-web/.venv/bin/python3 /home/ubuntu/kb-web/server.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

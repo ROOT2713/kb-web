@@ -1,0 +1,22 @@
+# 知识库本地数据 — 不提交
+uploads/
+meta.db
+data/
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境配置（含 API Key，绝不能提交）
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+
+# 导出文件（可选，按需提交）
+exports/
