@@ -1244,10 +1244,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     </div>
     <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <div class="icon">📄</div>
-      <div class="hint" id="drop-hint">点击或拖拽上传文档<br>支持 PDF / Word / Markdown / TXT</div>
-      <input type="file" id="file-input" accept=".pdf,.docx,.doc,.md,.txt" onchange="onFileSelected(this.files[0])">
+      <div class="hint" id="drop-hint">点击选择文件 / 拖拽上传<br>支持 PDF / Word / Markdown / TXT<br><small style="color:#aaa">支持多选和文件夹</small></div>
+      <input type="file" id="file-input" accept=".pdf,.docx,.doc,.md,.txt" multiple onchange="onFilesSelected(this.files)">
+      <input type="file" id="folder-input" webkitdirectory onchange="onFilesSelected(this.files)" style="display:none">
     </div>
-    <button class="upload-btn" id="upload-btn" disabled onclick="doUpload()">上传到知识库</button>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button class="upload-btn" id="upload-btn" disabled onclick="doUpload()" style="flex:1">上传到知识库</button>
+      <button class="upload-btn" id="folder-btn" onclick="document.getElementById('folder-input').click()" style="flex:0 0 auto;background:#555;font-size:13px;padding:14px 18px">📁 文件夹</button>
+    </div>
     <div id="upload-result"></div>
   </div>
 
@@ -1351,58 +1355,101 @@ function toggleSection(name) {
   }
 }
 
-function onFileSelected(file) {
-  if (!file) return;
-  selectedFile = file;
-  document.getElementById('drop-hint').innerHTML = `<span class="file-selected">📎 ${file.name}</span><br><small style="color:#999">${(file.size/1024).toFixed(1)} KB</small>`;
+let uploadQueue = [];  // {file, title}
+
+function onFilesSelected(fileList) {
+  if (!fileList || fileList.length === 0) return;
+  uploadQueue = [];
+  const hint = document.getElementById('drop-hint');
+  
+  for (const f of fileList) {
+    uploadQueue.push({file: f, title: f.name.replace(/\.[^.]+$/, '')});
+  }
+  
+  if (uploadQueue.length === 1) {
+    const f = uploadQueue[0].file;
+    hint.innerHTML = `<span class="file-selected">📎 ${f.name}</span><br><small style="color:#999">${(f.size/1024).toFixed(1)} KB</small>`;
+  } else {
+    const totalSize = uploadQueue.reduce((s, q) => s + q.file.size, 0);
+    hint.innerHTML = `<span class="file-selected">📎 ${uploadQueue.length} 个文件</span><br><small style="color:#999">共 ${(totalSize/1024/1024).toFixed(1)} MB</small>`;
+  }
+  
   document.getElementById('upload-btn').disabled = false;
-  const titleInput = document.getElementById('upload-title');
-  if (!titleInput.value) titleInput.value = file.name.replace(/\\.[^.]+$/, '');
+  document.getElementById('upload-btn').textContent = `上传 ${uploadQueue.length} 个文件`;
 }
 
 async function doUpload() {
-  if (!selectedFile) return;
+  if (uploadQueue.length === 0) return;
   const btn = document.getElementById('upload-btn');
   const resultDiv = document.getElementById('upload-result');
-  btn.disabled = true; btn.textContent = '上传中...';
-  resultDiv.innerHTML = '';
-
-  const slowTimer = setTimeout(() => {
-    resultDiv.innerHTML = '<div class="result-msg" style="background:#fff3e0;color:#e65100">⏳ 处理中...扫描件 PDF 会进行 OCR 识别，可能需要数十秒</div>';
-  }, 10000);
-
-  const fd = new FormData();
-  fd.append('file', selectedFile);
-  fd.append('title', document.getElementById('upload-title').value.trim());
-  fd.append('category', document.getElementById('upload-category').value);
-  const uploadBank = document.getElementById('upload-bank').value;
-  fd.append('bank', uploadBank || (currentBank === 'all' ? 'kb' : currentBank));
+  const category = document.getElementById('upload-category').value;
+  const uploadBank = document.getElementById('upload-bank').value || (currentBank === 'all' ? 'kb' : currentBank);
   
-  try {
-    const r = await fetch('/api/upload', {method:'POST', body:fd});
-    clearTimeout(slowTimer);
-    const d = await r.json();
-    if (r.status === 409) {
-      resultDiv.innerHTML = '<div class="result-msg" style="background:#fff3e0;color:#e65100;white-space:pre-line">⚠️ ' + (d.detail || '文档已存在') + '</div>';
-      btn.disabled = false; btn.textContent = '上传到知识库'; return;
+  btn.disabled = true;
+  
+  // Build queue UI
+  let html = '<div style="font-size:13px;margin-bottom:8px;color:#555">📋 上传队列</div>';
+  uploadQueue.forEach((q, i) => {
+    html += `<div id="q-${i}" style="padding:6px 10px;margin:2px 0;background:#f8f8f8;border-radius:4px;font-size:12px;display:flex;align-items:center;gap:8px">
+      <span style="color:#bbb">⏳</span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${q.file.name}</span>
+      <span style="color:#999;flex-shrink:0">${(q.file.size/1024).toFixed(0)}KB</span>
+    </div>`;
+  });
+  resultDiv.innerHTML = html;
+  
+  // Process queue
+  let ok = 0, fail = 0, skip = 0;
+  for (let i = 0; i < uploadQueue.length; i++) {
+    const q = uploadQueue[i];
+    const row = document.getElementById('q-' + i);
+    row.querySelector('span').textContent = '⏺';
+    row.style.background = '#fff8e1';
+    
+    const fd = new FormData();
+    fd.append('file', q.file);
+    fd.append('title', q.title);
+    fd.append('category', category);
+    fd.append('bank', uploadBank);
+    
+    try {
+      const r = await fetch('/api/upload', {method:'POST', body:fd});
+      const d = await r.json();
+      if (r.status === 409) {
+        row.querySelector('span').textContent = '⚠️';
+        row.style.background = '#fff3e0';
+        row.title = d.detail || '文档已存在';
+        skip++;
+      } else if (d.ok) {
+        row.querySelector('span').textContent = '✅';
+        row.style.background = '#e8f5e9';
+        ok++;
+      } else {
+        row.querySelector('span').textContent = '❌';
+        row.style.background = '#ffebee';
+        row.title = d.detail || '上传失败';
+        fail++;
+      }
+    } catch(e) {
+      row.querySelector('span').textContent = '❌';
+      row.style.background = '#ffebee';
+      row.title = e.message;
+      fail++;
     }
-    if (d.ok) {
-      let msg = `<div class="result-msg success">✅ <b>${d.title}</b> 已入库 · ${d.chunks} 个片段 · ${d.total_chars} 字符<br><small>预览: ${d.preview}</small>`;
-      if (d.warning) msg += `<br><small style="color:#e67e22">⚠️ ${d.warning}</small>`;
-      msg += '</div>';
-      resultDiv.innerHTML = msg;
-      selectedFile = null;
-      document.getElementById('upload-title').value = '';
-      document.getElementById('drop-hint').innerHTML = '点击或拖拽上传文档<br>支持 PDF / Word / Markdown / TXT';
-      loadStats(); loadBanks();
-    } else {
-      resultDiv.innerHTML = '<div class="result-msg error">❌ 上传失败' + (d.detail ? ': ' + d.detail : '') + '</div>';
-    }
-  } catch(e) {
-    clearTimeout(slowTimer);
-    resultDiv.innerHTML = '<div class="result-msg error">上传失败: ' + (e.message === 'Failed to fetch' ? '网络超时或服务未响应' : e.message) + '</div>';
   }
-  btn.disabled = false; btn.textContent = '上传到知识库';
+  
+  // Summary
+  const summary = [];
+  if (ok > 0) summary.push(`✅ ${ok} 成功`);
+  if (skip > 0) summary.push(`⚠️ ${skip} 跳过`);
+  if (fail > 0) summary.push(`❌ ${fail} 失败`);
+  resultDiv.insertAdjacentHTML('afterbegin', 
+    `<div class="result-msg success" style="margin-bottom:8px">${summary.join(' · ')}</div>`);
+  
+  uploadQueue = [];
+  btn.textContent = '上传到知识库';
+  document.getElementById('drop-hint').innerHTML = '点击选择文件 / 拖拽上传<br>支持 PDF / Word / Markdown / TXT<br><small style="color:#aaa">支持多选和文件夹</small>';
+  loadStats(); loadBanks();
 }
 
 async function loadDocs() {
@@ -1506,8 +1553,7 @@ dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classL
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop', e => {
   e.preventDefault(); dropZone.classList.remove('dragover');
-  const file = e.dataTransfer.files[0];
-  if (file) onFileSelected(file);
+  if (e.dataTransfer.files.length > 0) onFilesSelected(e.dataTransfer.files);
 });
 </script>
 </body>
