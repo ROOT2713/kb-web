@@ -1062,6 +1062,47 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     return {"answer": answer, "sources": sources}
 
 
+@app.post("/api/follow-up")
+async def follow_up(
+    q: str = Form(...),
+    bank: str = Form("all"),
+    context: str = Form(""),
+    history: str = Form(""),
+):
+    """追问 — 跳过检索，直接用页面上下文 + 对话历史问 DeepSeek"""
+    if not q.strip():
+        raise HTTPException(400, "问题不能为空")
+
+    bank_cfg = get_bank_config(bank)
+    bank_prompt = bank_cfg["prompt"]
+
+    prompt = f"""{bank_prompt}
+
+你正在一个知识库问答系统的追问模式中。用户之前已经搜索过，以下是当前页面的完整信息：
+
+【当前页面的答案和来源】
+{context}
+
+【对话历史】
+{history}
+
+现在用户追问：
+{q}
+
+请基于上述上下文回答追问。如果上下文中没有足够信息，请如实说明。
+直接回答，不要重复上下文中已有的内容，除非需要引用。用中文回答。"""
+
+    try:
+        answer = await deepseek_chat([
+            {"role": "system", "content": bank_prompt},
+            {"role": "user", "content": prompt},
+        ])
+    except Exception as e:
+        answer = f"回答失败: {e}"
+
+    return {"answer": answer}
+
+
 @app.get("/api/documents/{doc_id}/content")
 async def get_document_content(doc_id: str):
     """返回文档的完整文本内容"""
@@ -2428,14 +2469,75 @@ function toggleHistory() {
   }
 }
 
-function doFollowUp() {
+async function doFollowUp() {
   const input = document.getElementById('follow-up-input');
   if (!input) return;
   const q = input.value.trim();
   if (!q) return;
-  document.getElementById('query').value = q;
   input.value = '';
-  doSearch();
+
+  // 收集当前页面上下文：答案区的完整文本
+  const answerArea = document.getElementById('answer-area');
+  const pageContext = answerArea ? answerArea.innerText : '';
+
+  // 构建对话历史
+  const NL = String.fromCharCode(10);
+  let histText = '';
+  if (conversationHistory.length > 0) {
+    histText = conversationHistory.map(h => '问：' + h.q + NL + '答：' + h.a).join(NL + NL);
+  }
+
+  // 显示 loading
+  const loadingDiv = document.createElement('div');
+  loadingDiv.className = 'loading';
+  loadingDiv.innerHTML = '<span class="spin"></span> 思考中...';
+  answerArea.appendChild(loadingDiv);
+
+  try {
+    const fd = new FormData();
+    fd.append('q', q);
+    fd.append('bank', currentBank);
+    fd.append('context', pageContext.substring(0, 4000));
+    fd.append('history', histText);
+
+    const r = await fetch('/api/follow-up', {method: 'POST', body: fd});
+    const d = await r.json();
+
+    // 移除 loading
+    loadingDiv.remove();
+
+    // 存入对话历史
+    conversationHistory.push({q: q, a: d.answer});
+    if (conversationHistory.length > 5) conversationHistory.shift();
+
+    // 追加显示追问回答
+    let html = '<div class="answer" style="border-left:3px solid #4a90d9;margin-top:12px">';
+    html += '<span class="bank-label ' + currentBank + '">💬 追问</span><br>';
+    html += d.answer.replace(/\\\\n/g, '<br>');
+    html += '</div>';
+
+    // 更新追问区域
+    html += '<div style="margin-top:14px;padding:12px 16px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)">';
+    html += '<div style="font-size:12px;color:#888;margin-bottom:8px;cursor:pointer" onclick="toggleHistory()">💬 对话历史 (' + conversationHistory.length + ' 轮) ▸</div>';
+    html += '<div id="history-thread" style="display:none;margin-bottom:10px;max-height:200px;overflow-y:auto;font-size:12px">';
+    conversationHistory.forEach((h, i) => {
+      html += '<div style="margin-bottom:8px"><div style="color:#e94560;font-weight:600">第' + (i+1) + '轮</div>';
+      html += '<div style="color:#333;margin:2px 0">Q: ' + h.q + '</div>';
+      html += '<div style="color:#666">A: ' + h.a.substring(0,150) + '...</div></div>';
+    });
+    html += '</div>';
+    html += '<div style="display:flex;gap:8px">';
+    html += '<input id="follow-up-input" placeholder="继续追问..." style="flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none" onkeydown="if(event.key===\\'Enter\\')doFollowUp()">';
+    html += '<button onclick="doFollowUp()" style="padding:10px 18px;background:#4a90d9;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">💬 追问</button>';
+    html += '<button onclick="clearConversation()" style="padding:10px 14px;background:#eee;color:#888;border:none;border-radius:8px;font-size:12px;cursor:pointer">清除</button>';
+    html += '</div></div>';
+
+    answerArea.innerHTML += html;
+
+  } catch(e) {
+    loadingDiv.remove();
+    answerArea.innerHTML += '<div class="result-msg error">追问失败: ' + e.message + '</div>';
+  }
 }
 
 function clearConversation() {
