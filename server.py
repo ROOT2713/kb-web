@@ -34,14 +34,13 @@ KB_BANK = "kb"  # 默认 bank（兼容旧数据，"全部"查询时用）
 
 # ── 多 Bank 配置 ──
 BANKS = {
-    "all":        {"name": "全部",     "hindsight": "kb", "prompt": "通用政务信息化知识库"},
-    "tech":       {"name": "技术实践", "hindsight": "tech", "prompt": "你是软件开发技术专家。精通前端/后端/Agent/DevOps，回答注重实战经验和架构设计。"},
-    "security":   {"name": "安全研究", "hindsight": "security", "prompt": "你是网络安全研究专家。精通渗透测试/漏洞分析/防御技术，回答注重技术细节和攻防思路。"},
-    "ai":         {"name": "AI探索",   "hindsight": "ai", "prompt": "你是AI技术专家。精通LLM/机器学习/模型训练，回答注重技术原理和实践经验。"},
-    "notes":      {"name": "综合笔记", "hindsight": "notes", "prompt": "你是知识管理助手。擅长整理归纳各类知识，回答清晰有条理。"},
-    "proposals":  {"name": "方案库",   "hindsight": "proposals", "prompt": "你是政务信息化项目方案专家。擅长解读政策文件、编写项目方案、提供立项咨询建议。回答时注重政策依据、方案结构和可行性分析。"},
-    "assessment": {"name": "测评库",   "hindsight": "assessment", "prompt": "你是政务信息化验收测评专家。精通等保测评、密码应用测评、软件造价评估、监理服务规范。回答时注重标准条款、测评要点和合规要求。"},
-    "projects":   {"name": "项目库",   "hindsight": "projects", "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定。回答时注重管理流程、审批要求和实操经验。"},
+    "all":           {"name": "全部",           "hindsight": "kb", "prompt": "通用政务信息化知识库"},
+    "project_docs":  {"name": "项目资料",       "hindsight": "kb", "prompt": "你是政务信息化项目管理专家。熟悉项目管理办法、验收管理细则、财政投资规定、软件行业基准数据。回答时注重管理流程、审批要求和实操经验。"},
+    "standards":     {"name": "规范",           "hindsight": "kb", "prompt": "你是政务信息化标准规范专家。精通GB/GA/T/EGAG/GDZW等国家及团体标准，覆盖等保测评、密码应用、监理服务、立项咨询、验收测评、会议系统、安防工程、数据中心等领域。回答时注重条款引用和合规要求。"},
+    "industry_docs": {"name": "信息化行业文档", "hindsight": "kb", "prompt": "你是政务信息化行业专家。熟悉电子政务工程造价、软件造价评估、信创替代、验收测评实务、行业政策解读。回答时注重实操经验和行业惯例。"},
+    "templates":     {"name": "方案模板",       "hindsight": "kb", "prompt": "你是政务信息化项目方案编写专家。精通建设开发类和运维服务类项目方案的编写规范、章节结构、技术路线选型。回答时注重模板结构和编写要点。"},
+    "tech_guides":   {"name": "技术指导书",     "hindsight": "kb", "prompt": "你是全栈技术专家。精通前端/后端/Agent/DevOps/安全/渗透测试/AI/LLM。回答注重实战经验、架构设计和攻防思路。"},
+    "general":       {"name": "综合文件",       "hindsight": "kb", "prompt": "你是知识管理助手。擅长整理归纳各类知识，回答清晰有条理。"},
 }
 
 # MinerU API 配置
@@ -511,18 +510,77 @@ async def hindsight_request(endpoint: str, method: str = "GET", json_data: dict 
         except Exception:
             raise Exception(f"Hindsight {method} {endpoint}: 响应不是有效 JSON: {resp.text[:200]}")
 
-async def recall(query: str, limit: int = 5, bank: str = "kb") -> list:
+async def recall(query: str, limit: int = 5, bank: str = "kb", max_tokens: int = 4096) -> list:
     """语义召回 — 支持指定 bank"""
     result = await hindsight_request(
         f"/v1/default/banks/{bank}/memories/recall",
         "POST",
-        {"query": query, "max_tokens": 4096},
+        {"query": query, "max_tokens": max_tokens},
     )
     return result.get("results", [])
 
 def get_bank_config(bank_key: str) -> dict:
     """获取 bank 配置，不存在则返回默认"""
     return BANKS.get(bank_key, BANKS["all"])
+
+def assess_quality(text: str) -> dict:
+    """评估文本质量，返回 {score, total_chars, meaningful_chars, issues}"""
+    if not text or len(text.strip()) < 50:
+        return {"score": 0, "total_chars": len(text), "meaningful_chars": 0,
+                "issues": ["文本过短（<50字符）"]}
+
+    total = len(text)
+    meaningful = 0
+    garbage_chars = 0  # replacement char U+FFFD
+    repeated_runs = 0
+
+    for i, ch in enumerate(text):
+        code = ord(ch)
+        # CJK Unified Ideographs + Extension A
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+            meaningful += 1
+        # ASCII letters/digits
+        elif (0x30 <= code <= 0x39) or (0x41 <= code <= 0x5A) or (0x61 <= code <= 0x7A):
+            meaningful += 1
+        # Common punctuation
+        elif 0x20 <= code <= 0x2F or 0x3A <= code <= 0x40:
+            meaningful += 1
+        elif code in (0x3001, 0x3002, 0xFF0C, 0xFF0E, 0xFF1A, 0xFF1B, 0xFF08, 0xFF09, 0x0A):
+            meaningful += 1
+        # Replacement character
+        elif code == 0xFFFD:
+            garbage_chars += 1
+        # Repeated char detection (3+ same in a row, skip spaces/newlines)
+        if i >= 2 and text[i] == text[i-1] == text[i-2] and ord(text[i]) > 32 and ord(text[i]) != 0x0A:
+            repeated_runs += 1
+
+    # Scores
+    garbage_ratio = garbage_chars / max(total, 1)
+    meaningful_ratio = meaningful / max(total, 1)
+    repeated_ratio = repeated_runs / max(total, 1)
+
+    # Weighted score
+    score = 100 * (meaningful_ratio * 0.7 + (1.0 - garbage_ratio) * 0.2 + (1.0 - repeated_ratio) * 0.1)
+    score = max(0, min(100, int(score)))
+
+    issues = []
+    if garbage_ratio > 0.05:
+        issues.append(f"存在 {garbage_chars} 个替换字符(�)，占比 {garbage_ratio*100:.1f}%")
+    if meaningful_ratio < 0.3:
+        issues.append(f"有效字符占比仅 {meaningful_ratio*100:.1f}%，疑似乱码")
+    if repeated_ratio > 0.1:
+        issues.append(f"重复字符占比 {repeated_ratio*100:.1f}%，可能存在编码损坏")
+    if len(text) < 200:
+        issues.append(f"文本仅 {len(text)} 字符，内容可能不完整")
+    if not issues:
+        issues.append("文本质量正常")
+
+    return {
+        "score": score,
+        "total_chars": total,
+        "meaningful_chars": meaningful,
+        "issues": issues,
+    }
 
 # ─── API ──────────────────────────────────────────────────────
 
@@ -532,6 +590,7 @@ async def upload(
     title: str = Form(""),
     category: str = Form(""),
     bank: str = Form("kb"),
+    confirm_quality: str = Form(""),
 ):
     """上传文档 → 解析 → 切片 → 存入 Hindsight（支持指定 bank）"""
     if not file.filename:
@@ -560,6 +619,19 @@ async def upload(
 
     if not text or len(text.strip()) < 10:
         raise HTTPException(400, "文档内容过短")
+
+    # ── 质量评估 ──
+    quality = assess_quality(text)
+    if quality["score"] < 80 and confirm_quality != "true":
+        return {
+            "ok": False,
+            "detail": f"文档解析质量较低（{quality['score']}%），可能存在乱码。建议检查后重新上传或使用 MinerU 解析。",
+            "quality": {
+                "score": quality["score"],
+                "issues": quality["issues"],
+                "needs_confirm": True,
+            }
+        }
 
     # ── 去重检测：按文件内容 SHA256 查重 ──
     content_hash = hashlib.sha256(content).hexdigest()
@@ -638,6 +710,31 @@ async def upload(
     db.commit()
     db.close()
 
+    # ── 完整性验证：上传后召回比对 ──
+    integrity = None
+    try:
+        await asyncio.sleep(2)  # 等待 Hindsight 索引
+        recalled_chunks = await recall(doc_title, limit=50, bank=hs_bank, max_tokens=32768)
+        recalled_text = "\n".join(r.get("text", "") for r in recalled_chunks)
+        if recalled_text and len(recalled_text) > 200:
+            coverage = min(100, round(len(recalled_text) / max(len(text), 1) * 100, 1))
+            integrity = {
+                "original_chars": len(text),
+                "recalled_chars": len(recalled_text),
+                "coverage_pct": coverage,
+                "status": "ok" if coverage >= 80 else ("partial" if coverage >= 50 else "low"),
+            }
+        else:
+            integrity = {
+                "original_chars": len(text),
+                "recalled_chars": len(recalled_text) if recalled_text else 0,
+                "coverage_pct": 0,
+                "status": "pending",
+                "note": "索引尚未完成，请稍后查看",
+            }
+    except Exception as e:
+        print(f"Upload integrity check failed for {doc_id}: {e}", file=sys.stderr)
+
     return {
         "ok": True,
         "doc_id": doc_id,
@@ -648,11 +745,17 @@ async def upload(
         "total_chars": len(text),
         "preview": text[:200] + ("..." if len(text) > 200 else ""),
         "warning": f"仅成功入库 {retained}/{len(memory_items)} 个文本片段" if retained < len(memory_items) else None,
+        "quality": {
+            "score": quality["score"],
+            "issues": quality["issues"],
+            "needs_confirm": quality["score"] < 80,
+        },
+        "integrity": integrity,
     }
 
 
 @app.post("/api/query")
-async def query(q: str = Form(...), bank: str = Form("all")):
+async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form("")):
     """搜索知识库 → 召回 → DeepSeek 合成答案（支持多 bank）"""
     if not q.strip():
         raise HTTPException(400, "问题不能为空")
@@ -711,27 +814,13 @@ async def query(q: str = Form(...), bank: str = Form("all")):
     else:
         db.close()
 
-    # 从 kb bank 召回历史数据 + 目标 bank 召回新数据
+    # 从 kb bank 召回（所有数据已统一存储）
     raw_results = await recall(q, limit=25, bank="kb")
-    
-    # 同时查目标 bank（新上传的数据在各 bank 中）
-    if bank != "all":
-        target_bank = bank_cfg["hindsight"]
-        if target_bank != "kb":
-            try:
-                target_results = await recall(q, limit=8, bank=target_bank)
-                # 目标 bank 结果排在前面
-                raw_results = target_results + raw_results
-            except Exception:
-                pass  # 目标 bank 可能为空或不存在
-    else:
-        # "全部"模式：并行查所有有数据的 bank
+    # "全部"模式增加召回深度
+    if bank == "all":
         try:
-            tasks = [recall(q, limit=3, bank=b) for b in ["proposals", "assessment", "projects"]]
-            extra_lists = await asyncio.gather(*tasks, return_exceptions=True)
-            for el in extra_lists:
-                if isinstance(el, list):
-                    raw_results = el + raw_results
+            extra = await recall(q, limit=15, bank="kb")
+            raw_results = extra + raw_results
         except Exception:
             pass
 
@@ -807,11 +896,13 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         combined = "；".join(merged)
         context_parts.append(f"[来源: {doc_name}]\n{combined}")
         
-        # 来源展示：取第一条的原文摘要
+        # Merge all top facts' cleaned text (up to 800 chars)
+        merged_text = "；".join([c for _, _, c in facts[:2]])
         sources.append({
             "doc": doc_name,
+            "doc_id": doc_id if not doc_id.startswith("_notag_") else None,
             "chunk": f"{len(facts)} 条相关",
-            "text": facts[0][0][:200],
+            "text": merged_text[:800],
         })
     
     # ── 限制 context 总量 ──
@@ -828,14 +919,23 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         context_parts = kept
     
     context = "\n\n---\n\n".join(context_parts)
-    sources = sources[:8]
+    sources = sources[:10]
 
+    # ── 追问上下文注入 ──
+    history_context = ""
+    if history.strip():
+        try:
+            history_context = f"\n\n【对话历史】\n{history.strip()}\n\n请结合上述对话历史理解当前问题。如果当前问题是追问，基于历史上下文中断的地方继续回答。"
+        except Exception:
+            pass
+    
     prompt = f"""{bank_prompt}
 
 基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。回答尽量详细，引用具体条款和数据。
 
 文档内容：
 {context}
+{history_context}
 
 问题：{q}
 
@@ -850,6 +950,218 @@ async def query(q: str = Form(...), bank: str = Form("all")):
         answer = f"答案生成失败: {e}"
 
     return {"answer": answer, "sources": sources}
+
+
+@app.get("/api/documents/{doc_id}/content")
+async def get_document_content(doc_id: str):
+    """返回文档的完整文本内容"""
+    # 从 meta.db 查找文档所属的 bank
+    db = get_db()
+    meta = db.execute("SELECT title, filename, bank, created_at FROM doc_meta WHERE doc_id = ?", (doc_id,)).fetchone()
+    db.close()
+    
+    if not meta:
+        raise HTTPException(404, "文档不存在")
+    
+    doc_bank = meta["bank"] or "kb"
+    bank_cfg = get_bank_config(doc_bank)
+    hs_bank = bank_cfg["hindsight"]  # 映射到 Hindsight bank
+    
+    # 尝试主 Hindsight bank
+    docs_result = await hindsight_request(
+        f"/v1/default/banks/{hs_bank}/documents",
+        timeout=10
+    )
+    doc_list = docs_result.get("items", []) or docs_result.get("documents", [])
+    
+    hindsight_doc_id = None
+    for d in doc_list:
+        tags = d.get("tags", [])
+        if f"doc_id:{doc_id}" in tags:
+            hindsight_doc_id = d.get("id")
+            break
+    
+    # 主 bank 未找到 → 回退旧 Hindsight bank 名
+    OLD_HINDSIGHT_BANKS = ["tech", "security", "ai", "notes", "proposals", "assessment", "projects"]
+    if not hindsight_doc_id:
+        for fallback in OLD_HINDSIGHT_BANKS:
+            if fallback == hs_bank:
+                continue
+            try:
+                fb_result = await hindsight_request(
+                    f"/v1/default/banks/{fallback}/documents",
+                    timeout=5
+                )
+                fb_list = fb_result.get("items", []) or fb_result.get("documents", [])
+                for d in fb_list:
+                    if f"doc_id:{doc_id}" in d.get("tags", []):
+                        hindsight_doc_id = d.get("id")
+                        hs_bank = fallback  # 用找到的 bank
+                        break
+            except Exception:
+                pass
+            if hindsight_doc_id:
+                break
+    
+    if not hindsight_doc_id:
+        # fallback: semantic recall by title
+        try:
+            title = meta["title"] or ""
+            if title:
+                recalled = await recall(title, limit=50, bank="kb", max_tokens=32768)
+                if recalled:
+                    full_text = "\n\n".join(r.get("text", "") for r in recalled)
+                    if full_text and len(full_text) > 50:
+                        return {
+                            "doc_id": doc_id,
+                            "title": title,
+                            "filename": meta["filename"] or "",
+                            "chunks": len(recalled),
+                            "text": full_text,
+                            "source": "recall",  # marker: content from semantic recall, not original
+                        }
+        except Exception:
+            pass
+        raise HTTPException(404, "文档内容未找到（可能尚未完成索引）")
+    
+    # 获取单个文档的完整内容（含 original_text，用正确的 hs_bank）
+    doc_detail = await hindsight_request(
+        f"/v1/default/banks/{hs_bank}/documents/{hindsight_doc_id}",
+        timeout=10
+    )
+    full_text = doc_detail.get("original_text", "") or doc_detail.get("text", "") or ""
+    chunks_count = doc_detail.get("memory_unit_count", 0)
+    
+    return {
+        "doc_id": doc_id,
+        "title": meta["title"] if meta else "未知文档",
+        "filename": meta["filename"] if meta else "",
+        "chunks": chunks_count,
+        "text": full_text,
+    }
+
+
+@app.post("/api/fetch-standard")
+async def fetch_standard(std_no: str = Form(...), bank: str = Form("kb")):
+    """从公开来源下载国家标准并入库"""
+    import subprocess, tempfile, os as _os_module
+    
+    if not std_no.strip():
+        raise HTTPException(400, "标准号不能为空")
+    
+    bank_cfg = get_bank_config(bank)
+    if bank == "all":
+        bank = "kb"
+    hs_bank = bank_cfg["hindsight"]
+    
+    # Step 1: Search with AnySearch
+    anysearch_cli = _os_module.path.expanduser("~/.agents/skills/anysearch/scripts/anysearch_cli.py")
+    try:
+        result = subprocess.run(
+            ["python3", anysearch_cli, "search", f"{std_no} 标准 PDF下载", "-m", "5", "--freshness", "year"],
+            capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "搜索超时")
+    except Exception as e:
+        raise HTTPException(500, f"搜索失败: {e}")
+    
+    # Parse URLs from markdown output
+    urls = [line.split("**URL**: ")[1].strip() for line in result.stdout.split('\n') if "**URL**: " in line]
+    if not urls:
+        raise HTTPException(404, f"未找到 {std_no} 的下载链接")
+    
+    # Step 2: Download PDF
+    pdf_path = None
+    import httpx as _httpx_module
+    async with _httpx_module.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for url in urls[:3]:
+            try:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200 and "application/pdf" in resp.headers.get("content-type", ""):
+                    fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+                    _os_module.write(fd, resp.content)
+                    _os_module.close(fd)
+                    break
+            except Exception:
+                continue
+    
+    if not pdf_path:
+        raise HTTPException(500, "下载失败：所有链接均不可用")
+    
+    # Step 3: Parse PDF
+    try:
+        text = ""
+        with open(pdf_path, "rb") as f:
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+        _os_module.unlink(pdf_path)
+    except Exception as e:
+        if _os_module.path.exists(pdf_path):
+            _os_module.unlink(pdf_path)
+        raise HTTPException(500, f"PDF解析失败: {e}")
+    
+    if not text or len(text.strip()) < 100:
+        raise HTTPException(400, "PDF内容过短，可能是扫描件")
+    
+    # Step 4: Upload to Hindsight
+    doc_title = std_no.strip()
+    chunk_size = 1000
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    doc_id = str(uuid.uuid4())
+    
+    memory_items = []
+    for i, chunk in enumerate(chunks):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        tags = [
+            f"doc:{doc_title}.pdf",
+            f"chunk:{i+1}/{len(chunks)}",
+            f"doc_id:{doc_id}",
+            f"title:{doc_title}",
+            f"bank:{bank}",
+        ]
+        memory_items.append({"content": chunk, "tags": tags, "type": "world"})
+    
+    success_count = 0
+    total_count = len(memory_items)
+    if memory_items:
+        dyn_timeout = max(120, min(len(memory_items) * 5, 600))
+        try:
+            result = await hindsight_request(
+                f"/v1/default/banks/{hs_bank}/memories",
+                "POST",
+                {"items": memory_items},
+                timeout=dyn_timeout,
+            )
+            success_count = result.get("items_count", 0)
+        except Exception as e:
+            raise HTTPException(500, f"入库失败: {e}")
+    
+    if success_count == 0:
+        raise HTTPException(500, "入库失败：所有chunk写入Hindsight均失败")
+    
+    # Step 5: Write meta.db
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO doc_meta (doc_id, title, category, filename, content_hash, bank, created_at) VALUES (?, ?, '', ?, '', ?, datetime('now'))",
+        (doc_id, doc_title, f"{doc_title}.pdf", bank)
+    )
+    db.commit()
+    db.close()
+    
+    return {
+        "ok": True,
+        "doc_id": doc_id,
+        "title": doc_title,
+        "bank": bank,
+        "text_length": len(text),
+        "chunks": f"{success_count}/{total_count}",
+    }
 
 
 @app.get("/api/documents")
@@ -1122,6 +1434,276 @@ async def reparse_document(doc_id: str):
     }
 
 
+@app.get("/api/audit")
+async def audit_knowledge_base():
+    """扫描知识库所有文档，输出质量检查报告"""
+    db = get_db()
+    rows = db.execute(
+        "SELECT doc_id, title, filename, bank, created_at FROM doc_meta WHERE bank NOT IN ('skip') ORDER BY created_at DESC"
+    ).fetchall()
+    db.close()
+
+    results = []
+    for row in rows:
+        doc_id = row["doc_id"]
+        title = row["title"] or "未知文档"
+        bank = row["bank"] or "kb"
+
+        # Get full text from Hindsight
+        bank_cfg = BANKS.get(bank, BANKS["all"])
+        hs_bank = bank_cfg["hindsight"]
+
+        full_text = ""
+        try:
+            # 先按 doc_id 精确查命名 bank
+            hindsight_doc_id = None
+            docs_result = await hindsight_request(
+                f"/v1/default/banks/{hs_bank}/documents", timeout=10
+            )
+            doc_list = docs_result.get("items", []) or docs_result.get("documents", [])
+            for d in doc_list:
+                if f"doc_id:{doc_id}" in d.get("tags", []):
+                    hindsight_doc_id = d.get("id")
+                    break
+            
+            # kb fallback
+            if not hindsight_doc_id and hs_bank != "kb":
+                docs_result = await hindsight_request(
+                    f"/v1/default/banks/kb/documents", timeout=10
+                )
+                doc_list = docs_result.get("items", []) or docs_result.get("documents", [])
+                for d in doc_list:
+                    if f"doc_id:{doc_id}" in d.get("tags", []):
+                        hindsight_doc_id = d.get("id")
+                        hs_bank = "kb"
+                        break
+            
+            if hindsight_doc_id:
+                # 找到了：直接取 original_text
+                doc_detail = await hindsight_request(
+                    f"/v1/default/banks/{hs_bank}/documents/{hindsight_doc_id}", timeout=10
+                )
+                full_text = doc_detail.get("original_text", "") or doc_detail.get("text", "") or ""
+            else:
+                # doc_id 未找到（consolidation 导致），改用标题语义搜索
+                try:
+                    recall_result = await recall(title, limit=50, bank="kb", max_tokens=32768)
+                    texts = []
+                    for r in recall_result:
+                        t = r.get("text", "") or ""
+                        if t.strip():
+                            texts.append(t.strip())
+                    full_text = "\n\n".join(texts)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        quality = assess_quality(full_text)
+
+        # ── 完整性检查：对比原始文件 ──
+        filename = row["filename"] or ""
+        completeness = None  # {available, original_chars, retrieved_chars, coverage_pct}
+        if filename:
+            upload_path = os.path.join(BASE_DIR, "uploads", filename)
+            if os.path.exists(upload_path):
+                try:
+                    with open(upload_path, "rb") as f:
+                        raw = f.read()
+                    # 尝试解析原文件获取字符数
+                    orig_chars = 0
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext == ".pdf":
+                        reader = pypdf.PdfReader(BytesIO(raw))
+                        for page in reader.pages:
+                            t = page.extract_text()
+                            if t:
+                                orig_chars += len(t)
+                    elif ext in (".txt", ".md"):
+                        orig_chars = len(raw.decode("utf-8", errors="ignore"))
+                    elif ext == ".docx":
+                        d = docx.Document(BytesIO(raw))
+                        orig_chars = sum(len(p.text) for p in d.paragraphs)
+                    
+                    if orig_chars > 0:
+                        coverage = min(100, round(len(full_text) / orig_chars * 100))
+                        completeness = {
+                            "available": True,
+                            "original_chars": orig_chars,
+                            "retrieved_chars": len(full_text),
+                            "coverage_pct": coverage,
+                        }
+                except Exception:
+                    pass
+        
+        if not completeness:
+            completeness = {"available": False, "reason": "原文件不可用（已删除或未保留）"}
+
+        results.append({
+            "doc_id": doc_id,
+            "title": title,
+            "bank": bank,
+            "chars": len(full_text),
+            "score": quality["score"],
+            "issues": quality["issues"],
+            "needs_refetch": quality["score"] < 70,
+            "completeness": completeness,
+        })
+
+    # Summary stats
+    total = len(results)
+    low_quality = [r for r in results if r["needs_refetch"]]
+    avg_score = sum(r["score"] for r in results) / max(total, 1)
+
+    return {
+        "total_docs": total,
+        "avg_score": round(avg_score, 1),
+        "low_quality_count": len(low_quality),
+        "documents": sorted(results, key=lambda x: x["score"]),
+    }
+
+
+@app.post("/api/audit/refetch")
+async def refetch_document(doc_id: str = Form(...), std_no: str = Form("")):
+    """重新下载标准文档，使用 MinerU 解析，替换旧数据"""
+    import subprocess, tempfile, os as _os_module
+
+    # Verify doc exists
+    db = get_db()
+    meta = db.execute("SELECT title, bank FROM doc_meta WHERE doc_id = ?", (doc_id,)).fetchone()
+    if not meta:
+        db.close()
+        raise HTTPException(404, "文档不存在")
+
+    old_bank = meta["bank"] or "kb"
+    bank_cfg = BANKS.get(old_bank, BANKS["all"])
+    hs_bank = bank_cfg["hindsight"]
+
+    search_term = std_no.strip() or meta["title"]
+    db.close()
+
+    # Step 1: Search AnySearch
+    anysearch_cli = _os_module.path.expanduser("~/.agents/skills/anysearch/scripts/anysearch_cli.py")
+    try:
+        result = subprocess.run(
+            ["python3", anysearch_cli, "search", f"{search_term} 标准 PDF下载", "-m", "5", "--freshness", "year"],
+            capture_output=True, text=True, timeout=30
+        )
+        urls = [line.split("**URL**: ")[1].strip() for line in result.stdout.split('\n') if "**URL**: " in line]
+    except Exception as e:
+        raise HTTPException(500, f"搜索失败: {e}")
+
+    if not urls:
+        raise HTTPException(404, f"未找到 {search_term} 的下载链接")
+
+    # Step 2: Download PDF
+    pdf_path = None
+    pdf_content = None
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        for url in urls[:3]:
+            try:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    ct = resp.headers.get("content-type", "")
+                    if "application/pdf" in ct or url.lower().endswith(".pdf"):
+                        pdf_content = resp.content
+                        fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+                        _os_module.write(fd, pdf_content)
+                        _os_module.close(fd)
+                        break
+            except Exception:
+                continue
+
+    if not pdf_path or not pdf_content:
+        raise HTTPException(500, "下载失败")
+
+    # Step 3: Parse with MinerU
+    text = ""
+    try:
+        text = await mineru_parse_pdf(f"{search_term}.pdf", pdf_content)
+    except Exception:
+        # Fallback to pypdf
+        with open(pdf_path, "rb") as f:
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+
+    _os_module.unlink(pdf_path)
+
+    if not text or len(text.strip()) < 100:
+        raise HTTPException(400, "PDF解析后内容过短")
+
+    # Step 4: Delete old vectors from Hindsight
+    try:
+        docs_result = await hindsight_request(
+            f"/v1/default/banks/{hs_bank}/documents", timeout=10
+        )
+        doc_list = docs_result.get("items", []) or docs_result.get("documents", [])
+        for d in doc_list:
+            tags = d.get("tags", [])
+            if f"doc_id:{doc_id}" in tags:
+                try:
+                    await hindsight_request(
+                        f"/v1/default/banks/{hs_bank}/documents/{d['id']}",
+                        method="DELETE", timeout=10
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Step 5: Re-upload with new text
+    chunk_size = 1000
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+    success_count = 0
+    total_count = 0
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, chunk in enumerate(chunks):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            total_count += 1
+            payload = [{
+                "text": chunk,
+                "tags": [
+                    f"doc:{search_term}.pdf",
+                    f"chunk:{i+1}/{len(chunks)}",
+                    f"doc_id:{doc_id}",
+                    f"title:{search_term}",
+                ]
+            }]
+            try:
+                r = await client.post(
+                    f"{HINDSIGHT_URL}/v1/default/banks/{hs_bank}/memories",
+                    json=payload
+                )
+                if r.status_code in (200, 201):
+                    success_count += 1
+            except Exception:
+                pass
+
+    # Update meta.db title
+    db = get_db()
+    db.execute("UPDATE doc_meta SET title = ? WHERE doc_id = ?", (search_term, doc_id))
+    db.commit()
+    db.close()
+
+    quality = assess_quality(text)
+
+    return {
+        "ok": True,
+        "doc_id": doc_id,
+        "title": search_term,
+        "text_length": len(text),
+        "chunks": f"{success_count}/{total_count}",
+        "new_score": quality["score"],
+        "used_mineru": bool(MINERU_TOKEN),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(INDEX_HTML)
@@ -1172,6 +1754,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .section-btn:hover,.section-btn.active{border-color:#e94560;color:#e94560}
 .upload-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
 .upload-form.show{display:block}
+.standard-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.standard-form.show{display:block}
+.audit-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.audit-form.show{display:block}
 .form-group{margin-bottom:14px}
 .form-group label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px}
 .form-group input,.form-group select{width:100%;padding:12px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none}
@@ -1208,9 +1794,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 </style>
 </head>
 <body>
-<div class="header">
+<div class="header" style="display:flex;align-items:center;justify-content:space-between">
   <h1>📚 知识库</h1>
-  <div class="stats" id="stats">加载中...</div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <button onclick="resetAll()" style="background:none;border:1px solid rgba(255,255,255,0.3);color:#fff;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px" title="刷新页面">🔄 刷新</button>
+    <div class="stats" id="stats">加载中...</div>
+  </div>
 </div>
 <div class="bank-bar" id="bank-bar">
   <label>📂 知识库分类：</label>
@@ -1227,6 +1816,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="section-bar">
     <button class="section-btn active" id="btn-upload" onclick="toggleSection('upload')">📤 上传文档</button>
     <button class="section-btn" id="btn-docs" onclick="toggleSection('docs')">📋 文档列表</button>
+    <button class="section-btn" id="btn-standard" onclick="toggleSection('standard')">📥 规范下载</button>
+    <button class="section-btn" id="btn-audit" onclick="toggleSection('audit')">🔍 数据自查</button>
   </div>
 
   <div class="upload-form" id="upload-form">
@@ -1255,6 +1846,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div id="upload-result"></div>
   </div>
 
+  <div class="standard-form" id="standard-form">
+    <div class="form-group">
+      <label>📌 标准号</label>
+      <input id="std-no" placeholder="例如: GB 50348, GB/T 22239, ISO 27001" style="width:100%;padding:12px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')doFetchStandard()">
+    </div>
+    <div class="form-group">
+      <label>🏷️ 入库分类</label>
+      <select id="std-bank"><option value="">-- 加载中 --</option></select>
+    </div>
+    <button class="upload-btn" onclick="doFetchStandard()">🔍 搜索并下载入库</button>
+    <div id="std-result" style="margin-top:12px"></div>
+  </div>
+
+  <div class="audit-form" id="audit-form">
+    <button class="upload-btn" onclick="doAudit()" style="margin-bottom:14px">🔍 开始自查</button>
+    <div id="audit-result"></div>
+  </div>
+
   <div id="doc-search-bar" style="display:none;margin-bottom:12px">
     <input id="doc-search" placeholder="🔍 搜索文档标题..." oninput="renderDocs()" style="width:100%;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none">
   </div>
@@ -1266,6 +1875,7 @@ let currentBank = 'all';
 let selectedFile = null;
 let allDocs = [];
 let bankData = [];
+let conversationHistory = [];  // [{q, a}] for follow-up
 
 async function init() {
   await loadBanks();
@@ -1307,6 +1917,16 @@ function switchBank(bank) {
   }
 }
 
+function resetAll() {
+  currentBank = 'all';
+  document.getElementById('bank-selector').value = 'all';
+  document.getElementById('answer-area').innerHTML = '';
+  document.getElementById('query').value = '';
+  document.getElementById('query').focus();
+  // Clear conversation history
+  conversationHistory = [];
+}
+
 async function doSearch() {
   const q = document.getElementById('query').value.trim();
   if (!q) return;
@@ -1315,19 +1935,99 @@ async function doSearch() {
   
   try {
     const fd = new FormData(); fd.append('q', q); fd.append('bank', currentBank);
+    // Append conversation history if exists
+    if (conversationHistory.length > 0) {
+      const NL = String.fromCharCode(10); const histText = conversationHistory.map(h => '问：' + h.q + NL + '答：' + h.a).join(NL + NL);
+      fd.append('history', histText);
+    }
     const r = await fetch('/api/query', {method:'POST', body:fd});
     const d = await r.json();
     const bankName = (bankData.find(b => b.key === currentBank) || {}).name || currentBank;
-    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+bankName+'</span><br>' + d.answer.replace(/\\n/g,'<br>') + '</div>';
+    
+    // Store in conversation history
+    conversationHistory.push({q: q, a: d.answer});
+    // Keep only last 3 turns
+    if (conversationHistory.length > 3) conversationHistory.shift();
+    
+    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+bankName+'</span><br>' + d.answer.replace(/\\\\n/g,'<br>') + '</div>';
     if (d.sources && d.sources.length) {
       html += '<div class="sources"><strong>📎 参考来源</strong></div>';
-      d.sources.forEach(s => {
-        html += `<div class="source"><div class="doc">${s.doc} · ${s.chunk}</div><div class="text">${s.text}</div></div>`;
+      d.sources.forEach((s, idx) => {
+        const docId = s.doc_id || '';
+        const viewLink = docId ? ` <a href="javascript:viewDocContent('${docId}','${s.doc.replace(/'/g,"\\\\'")}')" style="color:#e94560;font-size:11px">📖 查看原文</a>` : '';
+        html += `<div class="source" id="src-${idx}">
+          <div class="doc">${s.doc} · ${s.chunk}${viewLink}</div>
+          <div class="text">${s.text}</div>
+          <div id="src-content-${idx}" style="display:none;margin-top:8px;padding:8px;background:#fff;border:1px solid #eee;border-radius:4px;max-height:400px;overflow-y:auto;font-size:12px;line-height:1.8;white-space:pre-wrap"></div>
+        </div>`;
       });
+    }
+    // Follow-up input section
+    if (conversationHistory.length >= 1) {
+      html += '<div style="margin-top:14px;padding:12px 16px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)">';
+      html += '<div style="font-size:12px;color:#888;margin-bottom:8px;cursor:pointer" onclick="toggleHistory()">💬 对话历史 (' + conversationHistory.length + ' 轮) ▸</div>';
+      html += '<div id="history-thread" style="display:none;margin-bottom:10px;max-height:200px;overflow-y:auto;font-size:12px">';
+      conversationHistory.forEach((h, i) => {
+        html += '<div style="margin-bottom:8px"><div style="color:#e94560;font-weight:600">🙋 第' + (i+1) + '轮</div>';
+        html += '<div style="color:#333;margin:2px 0">Q: ' + h.q + '</div>';
+        html += '<div style="color:#666">A: ' + h.a.substring(0,150) + '...</div></div>';
+      });
+      html += '</div>';
+      html += '<div style="display:flex;gap:8px">';
+      html += '<input id="follow-up-input" placeholder="追问..." style="flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none" onkeydown="if(event.key===\\'Enter\\')doFollowUp()">';
+      html += '<button onclick="doFollowUp()" style="padding:10px 18px;background:#4a90d9;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">💬 追问</button>';
+      html += '<button onclick="clearConversation()" style="padding:10px 14px;background:#eee;color:#888;border:none;border-radius:8px;font-size:12px;cursor:pointer">清除</button>';
+      html += '</div></div>';
     }
     area.innerHTML = html;
   } catch(e) {
     area.innerHTML = '<div class="result-msg error">搜索失败: '+e.message+'</div>';
+  }
+}
+
+async function viewDocContent(docId, title) {
+  // Find the source container
+  const allSources = document.querySelectorAll('.source');
+  let targetIdx = -1;
+  allSources.forEach((src, i) => {
+    if (src.querySelector('a') && src.querySelector('a').href && src.querySelector('a').href.includes(docId)) {
+      targetIdx = i;
+    }
+  });
+  if (targetIdx < 0) {
+    // Fallback: find by docId in the href
+    for (let i = 0; i < allSources.length; i++) {
+      const a = allSources[i].querySelector('a');
+      if (a && a.getAttribute('href') && a.getAttribute('href').includes(docId)) {
+        targetIdx = i;
+        break;
+      }
+    }
+  }
+  if (targetIdx < 0) return;
+  
+  const contentDiv = document.getElementById('src-content-' + targetIdx);
+  if (contentDiv.style.display === 'block') {
+    contentDiv.style.display = 'none';
+    return;
+  }
+  
+  contentDiv.style.display = 'block';
+  contentDiv.innerHTML = '<div class="loading"><span class="spin"></span>加载原文...</div>';
+  
+  try {
+    const r = await fetch('/api/documents/' + docId + '/content');
+    const d = await r.json();
+    if (!d.text) {
+      contentDiv.innerHTML = '<div class="result-msg error">' + (d.detail || '文档内容未找到') + '</div>';
+      return;
+    }
+    const NL = String.fromCharCode(10);
+    const safeTitle = (d.title || '未知').replace(/</g,'&lt;');
+    const safeText = d.text.replace(/</g,'&lt;').replace(/\\\\\\\\n/g, NL);
+    contentDiv.innerHTML = '<strong>📄 ' + safeTitle + '</strong>（' + d.chunks + ' 个片段，' + d.text.length + ' 字符）<hr style="border-color:#eee;margin:6px 0">' + safeText.replace(new RegExp(NL,'g'),'<br>');
+  } catch(e) {
+    contentDiv.innerHTML = '<div class="result-msg error">加载失败: '+e.message+'</div>';
   }
 }
 
@@ -1338,24 +2038,181 @@ function toggleSection(name) {
     document.getElementById('btn-upload').classList.toggle('active', form.classList.contains('show'));
     if (form.classList.contains('show')) {
       document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('audit-form').classList.remove('show');
       document.getElementById('btn-docs').classList.remove('active');
+      document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('btn-audit').classList.remove('active');
     }
-  } else {
+  } else if (name === 'docs') {
     const list = document.getElementById('doc-list');
     list.classList.toggle('show');
     document.getElementById('btn-docs').classList.toggle('active', list.classList.contains('show'));
     if (list.classList.contains('show')) {
       document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('audit-form').classList.remove('show');
       document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('btn-audit').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'block';
       loadDocs();
     } else {
       document.getElementById('doc-search-bar').style.display = 'none';
     }
+  } else if (name === 'standard') {
+    const stdForm = document.getElementById('standard-form');
+    stdForm.classList.toggle('show');
+    document.getElementById('btn-standard').classList.toggle('active', stdForm.classList.contains('show'));
+    if (stdForm.classList.contains('show')) {
+      document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('btn-docs').classList.remove('active');
+      document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('doc-search-bar').style.display = 'none';
+      // Populate bank dropdown for standard form
+      const stdBank = document.getElementById('std-bank');
+      if (stdBank && bankData.length > 0 && stdBank.options.length <= 1) {
+        stdBank.innerHTML = '<option value="">-- 选择分类 --</option>' +
+          bankData.filter(b => b.key !== 'all').map(b => '<option value="' + b.key + '">' + b.name + '</option>').join('');
+      }
+    }
+  } else if (name === 'audit') {
+    const auditForm = document.getElementById('audit-form');
+    auditForm.classList.toggle('show');
+    document.getElementById('btn-audit').classList.toggle('active', auditForm.classList.contains('show'));
+    if (auditForm.classList.contains('show')) {
+      document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('btn-docs').classList.remove('active');
+      document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('doc-search-bar').style.display = 'none';
+      doAudit();
+    }
+  }
+}
+
+function toggleHistory() {
+  const thread = document.getElementById('history-thread');
+  if (thread) {
+    thread.style.display = thread.style.display === 'none' ? 'block' : 'none';
+  }
+}
+
+function doFollowUp() {
+  const input = document.getElementById('follow-up-input');
+  if (!input) return;
+  const q = input.value.trim();
+  if (!q) return;
+  document.getElementById('query').value = q;
+  input.value = '';
+  doSearch();
+}
+
+function clearConversation() {
+  conversationHistory = [];
+  document.getElementById('answer-area').innerHTML = '';
+  document.getElementById('query').value = '';
+  document.getElementById('query').focus();
+}
+
+async function doFetchStandard() {
+  const stdNo = document.getElementById('std-no').value.trim();
+  if (!stdNo) return;
+  const bank = document.getElementById('std-bank').value || 'kb';
+  const resultDiv = document.getElementById('std-result');
+  
+  resultDiv.innerHTML = '<div class="loading"><span class="spin"></span>搜索中...</div>';
+  
+  try {
+    const fd = new FormData();
+    fd.append('std_no', stdNo);
+    fd.append('bank', bank);
+    
+    resultDiv.innerHTML = '<div class="loading"><span class="spin"></span>下载中...</div>';
+    const r = await fetch('/api/fetch-standard', {method:'POST', body:fd});
+    const d = await r.json();
+    
+    if (d.ok) {
+      const bankName = (bankData.find(b => b.key === d.bank) || {}).name || d.bank;
+      resultDiv.innerHTML = '<div class="result-msg success">✅ ' + d.title + ' 已入库<br>' +
+        '<small>分类：' + bankName + ' | ' + (d.text_length||0) + ' 字符 | ' + (d.chunks||'?') + ' chunks</small><br>' +
+        '<small style="color:#999">doc_id: ' + (d.doc_id||'?').substring(0,8) + '...</small></div>';
+      document.getElementById('std-no').value = '';
+      loadStats(); loadBanks();
+    } else {
+      resultDiv.innerHTML = '<div class="result-msg error">' + (d.detail || '下载失败') + '</div>';
+    }
+  } catch(e) {
+    resultDiv.innerHTML = '<div class="result-msg error">' + e.message + '</div>';
   }
 }
 
 let uploadQueue = [];  // {file, title}
+
+async function doAudit() {
+  const resultDiv = document.getElementById('audit-result');
+  const q = String.fromCharCode(39);
+  resultDiv.innerHTML = '<div class="loading"><span class="spin"></span>正在扫描知识库...</div>';
+
+  try {
+    const r = await fetch('/api/audit');
+    const d = await r.json();
+
+    let html = '<div class="result-msg success" style="margin-bottom:12px">';
+    html += '📊 共 ' + d.total_docs + ' 篇文档，平均质量 ' + d.avg_score + '%';
+    if (d.low_quality_count > 0) {
+      html += ' · <span style="color:#c62828">⚠️ ' + d.low_quality_count + ' 篇需关注</span>';
+    }
+    html += '</div>';
+
+    if (d.documents && d.documents.length) {
+      html += '<div style="max-height:500px;overflow-y:auto">';
+      d.documents.forEach(doc => {
+        const color = doc.score >= 80 ? '#2e7d32' : doc.score >= 60 ? '#e67e22' : '#c62828';
+        const badge = doc.needs_refetch ? ' <span style="background:#c62828;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px">需重下</span>' : '';
+        const refetchBtn = doc.needs_refetch ? `<button onclick="doRefetch(${q}${doc.doc_id}${q},${q}${(doc.title||'').replace(new RegExp(q,'g'),'\\\\'+q)}${q},this)" style="font-size:10px;padding:2px 6px;background:#e94560;color:#fff;border:none;border-radius:3px;cursor:pointer">🔄 重下</button>` : '';
+        html += '<div style="padding:8px 12px;border-bottom:1px solid #f0f0f0;font-size:13px">';
+        html += '<span style="font-weight:600;color:' + color + '">' + doc.score + '%</span>';
+        html += ' <span>' + doc.title + '</span>' + badge + refetchBtn;
+        html += '<div style="color:#999;font-size:11px">' + (doc.chars||0) + ' 字符 · ' + (doc.issues||[]).join(' · ') + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    resultDiv.innerHTML = html;
+  } catch(e) {
+    resultDiv.innerHTML = '<div class="result-msg error">自查失败: ' + e.message + '</div>';
+  }
+}
+
+async function doRefetch(docId, title, btn) {
+  if (!confirm('确认重新下载「' + title + '」？将使用 MinerU 重新解析并替换原有数据。')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const fd = new FormData();
+    fd.append('doc_id', docId);
+    fd.append('std_no', title);
+    const r = await fetch('/api/audit/refetch', {method:'POST', body:fd});
+    const d = await r.json();
+    if (d.ok) {
+      btn.textContent = '✅';
+      btn.style.background = '#27ae60';
+      alert('重新入库成功！质量评分: ' + d.new_score + '%');
+    } else {
+      btn.textContent = '❌';
+      alert('失败: ' + (d.detail || '未知错误'));
+    }
+  } catch(e) {
+    btn.textContent = '❌';
+    alert('失败: ' + e.message);
+  }
+}
 
 function onFilesSelected(fileList) {
   if (!fileList || fileList.length === 0) return;
@@ -1420,9 +2277,44 @@ async function doUpload() {
         row.style.background = '#fff3e0';
         row.title = d.detail || '文档已存在';
         skip++;
+      } else if (d.quality && d.quality.needs_confirm && !d.ok) {
+        row.querySelector('span').textContent = '⚠️';
+        row.style.background = '#fff3e0';
+        row.title = '质量评分: ' + d.quality.score + '% - ' + (d.quality.issues || []).join(', ');
+        const NL = String.fromCharCode(10);
+        const confirmed = confirm(
+          '文档解析质量较低（' + d.quality.score + '%）' + NL + NL +
+          '问题: ' + (d.quality.issues || []).join(NL) + NL + NL +
+          '是否仍然上传？建议取消后使用 MinerU 重新解析。'
+        );
+        if (confirmed) {
+          const fd2 = new FormData();
+          fd2.append('file', q.file);
+          fd2.append('title', q.title);
+          fd2.append('category', category);
+          fd2.append('bank', uploadBank);
+          fd2.append('confirm_quality', 'true');
+          const r2 = await fetch('/api/upload', {method:'POST', body:fd2});
+          const d2 = await r2.json();
+          if (d2.ok) {
+            row.querySelector('span').textContent = '✅';
+            row.style.background = '#e8f5e9';
+            ok++;
+          } else {
+            row.querySelector('span').textContent = '❌';
+            row.style.background = '#ffebee';
+            fail++;
+          }
+        } else {
+          skip++;
+        }
       } else if (d.ok) {
         row.querySelector('span').textContent = '✅';
         row.style.background = '#e8f5e9';
+        let tip = '';
+        if (d.quality) tip += '质量评分: ' + d.quality.score + '%';
+        if (d.integrity && d.integrity.status === 'ok') tip += ' · 完整性: ' + d.integrity.coverage_pct + '%';
+        row.title = tip;
         ok++;
       } else {
         row.querySelector('span').textContent = '❌';
