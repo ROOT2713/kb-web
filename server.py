@@ -16,6 +16,8 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import pypdf
 import docx
+from rank_bm25 import BM25Okapi
+import jieba
 
 # ─── 环境 ────────────────────────────────────────────────────
 ENV_FILE = os.path.expanduser("~/.hermes/.env")
@@ -510,6 +512,97 @@ async def hindsight_request(endpoint: str, method: str = "GET", json_data: dict 
         except Exception:
             raise Exception(f"Hindsight {method} {endpoint}: 响应不是有效 JSON: {resp.text[:200]}")
 
+
+# ── BM25 索引管理（带 TTL 缓存）──
+_bm25_cache = {"index": None, "docs": [], "bank": None, "ts": 0}
+_BM25_TTL = 300  # 5 分钟缓存
+
+def _tokenize(text: str) -> list:
+    """jieba 分词，去掉单字符和空白"""
+    return [w for w in jieba.cut(text) if len(w.strip()) > 1]
+
+async def build_bm25_index(bank: str = "all") -> tuple:
+    """从 Hindsight 加载全部 facts 构建 BM25 索引（带缓存）"""
+    import time
+    now = time.time()
+    if _bm25_cache["index"] and _bm25_cache["bank"] == bank and (now - _bm25_cache["ts"]) < _BM25_TTL:
+        return _bm25_cache["index"], _bm25_cache["docs"]
+
+    # 从 Hindsight 大 limit 召回获取全部 facts
+    all_facts = await recall("", limit=100, bank="kb", max_tokens=65536)  # 空 query 拿全部
+    
+    # 如果空 query 不返回结果，用常见词触发
+    if not all_facts:
+        all_facts = await recall("政务信息化 标准 规范", limit=100, bank="kb", max_tokens=65536)
+    
+    docs = []
+    for r in all_facts:
+        text = r.get("text", "") or ""
+        tags = r.get("tags", [])
+        doc_id = None
+        for t in tags:
+            if t.startswith("doc_id:"):
+                doc_id = t[7:]
+                break
+        if text.strip():
+            docs.append({"text": text, "doc_id": doc_id or "_unknown_", "tags": tags})
+    
+    if not docs:
+        return None, []
+    
+    # 构建 BM25 索引
+    tokenized = [_tokenize(d["text"]) for d in docs]
+    bm25 = BM25Okapi(tokenized)
+    
+    _bm25_cache.update({"index": bm25, "docs": docs, "bank": bank, "ts": now})
+    return bm25, docs
+
+def bm25_search(query: str, bm25, docs: list, top_k: int = 10) -> list:
+    """BM25 关键词搜索"""
+    if not bm25 or not docs:
+        return []
+    query_tokens = _tokenize(query)
+    scores = bm25.get_scores(query_tokens)
+    # 取 top_k
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    results = []
+    for idx in top_indices:
+        if scores[idx] > 0:
+            results.append({"text": docs[idx]["text"], "doc_id": docs[idx]["doc_id"], 
+                          "tags": docs[idx]["tags"], "bm25_score": float(scores[idx])})
+    return results
+
+def rrf_merge(dense_results: list, bm25_results: list, k: int = 60) -> list:
+    """Reciprocal Rank Fusion 融合两路召回结果"""
+    doc_scores = {}
+    doc_data = {}
+    
+    # Dense 结果按排名打分
+    for rank, r in enumerate(dense_results):
+        text = r.get("text", "")
+        doc_id = None
+        for t in r.get("tags", []):
+            if t.startswith("doc_id:"):
+                doc_id = t[7:]
+                break
+        key = doc_id or text[:50]
+        doc_scores[key] = doc_scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in doc_data:
+            doc_data[key] = r
+    
+    # BM25 结果按排名打分
+    for rank, r in enumerate(bm25_results):
+        text = r.get("text", "")
+        doc_id = r.get("doc_id")
+        key = doc_id or text[:50]
+        doc_scores[key] = doc_scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in doc_data:
+            doc_data[key] = r
+    
+    # 按 RRF 分数排序
+    sorted_keys = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+    return [doc_data[k] for k in sorted_keys]
+
 async def recall(query: str, limit: int = 5, bank: str = "kb", max_tokens: int = 4096) -> list:
     """语义召回 — 支持指定 bank"""
     result = await hindsight_request(
@@ -814,7 +907,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     else:
         db.close()
 
-    # 从 kb bank 召回（所有数据已统一存储）
+    # ── Hybrid Search: Dense + BM25 RRF 融合 ──
     raw_results = await recall(q, limit=25, bank="kb")
     # "全部"模式增加召回深度
     if bank == "all":
@@ -824,8 +917,19 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
         except Exception:
             pass
 
+    # BM25 关键词召回（补充语义召回的盲区）
+    bm25_merged = raw_results  # 默认 fallback
+    try:
+        bm25_index, bm25_docs = await build_bm25_index(bank)
+        if bm25_index:
+            bm25_hits = bm25_search(q, bm25_index, bm25_docs, top_k=15)
+            if bm25_hits:
+                bm25_merged = rrf_merge(raw_results, bm25_hits, k=60)
+    except Exception as e:
+        print(f"[WARN] BM25 fallback: {e}", flush=True)
+
     # 精确结果排在最前面
-    all_results = exact_results + raw_results
+    all_results = exact_results + bm25_merged
 
     # ── 清洗 + 过滤 + 去重合并 ──
     doc_facts = {}  # doc_id → [(text, doc_name, cleaned_text), ...]
@@ -931,7 +1035,13 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     
     prompt = f"""{bank_prompt}
 
-基于以下文档内容回答问题。如果文档中没有相关信息，请如实说明。回答尽量详细，引用具体条款和数据。
+【硬性规则】
+1. 只使用下方「文档内容」中的信息回答，禁止使用你的训练知识补充任何事实
+2. 每个关键论断必须在括号内标注来源文档名称
+3. 文档中没有相关信息时，直接回答「根据现有资料无法确定，建议查阅原文」
+4. 多个文档存在矛盾时，列出不同说法并各自标注来源
+
+基于以下文档内容回答问题：
 
 文档内容：
 {context}
@@ -939,7 +1049,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
 
 问题：{q}
 
-请用中文回答，并在答案中标注信息来源（文档名称）。"""
+请用中文回答，引用具体条款和数据，并标注信息来源。"""
 
     try:
         answer = await deepseek_chat([
@@ -1434,6 +1544,135 @@ async def reparse_document(doc_id: str):
     }
 
 
+@app.get("/api/rag-eval")
+async def rag_evaluation():
+    """RAG 效果评估 — 4 维度（RAGAS 风格）"""
+
+    # 预置测试用例：覆盖各 bank 典型查询
+    test_cases = [
+        {"q": "等保三级的安全区域边界要求是什么", "bank": "standards", "expect_doc": "等级保护"},
+        {"q": "政务信息化项目验收流程有哪些步骤", "bank": "project_docs", "expect_doc": "验收"},
+        {"q": "软件造价评估的方法和依据是什么", "bank": "industry_docs", "expect_doc": "造价"},
+        {"q": "密码应用方案的测评要求是什么", "bank": "standards", "expect_doc": "密码"},
+        {"q": "信息化项目立项咨询的主要内容", "bank": "project_docs", "expect_doc": "立项"},
+        {"q": "等保测评的国家标准编号是什么", "bank": "standards", "expect_doc": "GB"},
+        {"q": "政务信息化监理服务的职责范围", "bank": "standards", "expect_doc": "监理"},
+        {"q": "数据中心建设的技术要求", "bank": "standards", "expect_doc": "数据中心"},
+    ]
+
+    results = []
+    dimensions = {"retrieval": [], "groundedness": [], "relevance": [], "utilization": []}
+
+    for tc in test_cases:
+        try:
+            # Step 1: 召回
+            recalled = await recall(tc["q"], limit=10, bank="kb")
+            context_texts = [r.get("text", "") for r in recalled if r.get("text")]
+            context_block = "\n\n---\n\n".join(context_texts[:5])
+
+            if not context_block.strip():
+                results.append({"q": tc["q"], "bank": tc["bank"], "error": "无召回结果",
+                               "scores": {"retrieval": 0, "groundedness": 0, "relevance": 0, "utilization": 0}})
+                continue
+
+            # Step 2: 生成答案（复用现有逻辑）
+            bank_cfg = get_bank_config(tc["bank"])
+            bank_prompt = bank_cfg["prompt"]
+            answer_prompt = f"""{bank_prompt}
+
+【硬性规则】
+1. 只使用下方「文档内容」中的信息回答，禁止使用你的训练知识补充任何事实
+2. 每个关键论断必须在括号内标注来源文档名称
+3. 文档中没有相关信息时，直接回答「根据现有资料无法确定」
+
+基于以下文档内容回答问题：
+
+文档内容：
+{context_block}
+
+问题：{tc["q"]}
+
+请用中文回答，引用具体条款和数据，并标注信息来源。"""
+
+            answer = await deepseek_chat([
+                {"role": "system", "content": bank_prompt},
+                {"role": "user", "content": answer_prompt},
+            ])
+
+            # Step 3: LLM 评估 4 个维度
+            eval_prompt = f"""你是一个 RAG 系统评估专家。请对以下问答对进行 4 个维度的评分。
+
+【问题】{tc["q"]}
+
+【检索到的文档片段】
+{context_block[:3000]}
+
+【生成的答案】
+{answer[:2000]}
+
+请对以下 4 个维度分别打分（0.0 ~ 1.0），并给出简短理由：
+
+1. Retrieval（检索质量）：检索到的文档片段与问题的相关性
+2. Groundedness（可对应性）：答案中的每句话能否在文档片段中找到依据
+3. Relevance（答案相关性）：答案是否切题、是否回答了问题
+4. Utilization（利用率）：答案是否充分利用了检索到的文档内容
+
+请严格用以下 JSON 格式回复，不要有其他内容：
+{{"retrieval": {{"score": 0.0, "reason": "..."}}, "groundedness": {{"score": 0.0, "reason": "..."}}, "relevance": {{"score": 0.0, "reason": "..."}}, "utilization": {{"score": 0.0, "reason": "..."}}}}"""
+
+            eval_result = await deepseek_chat([
+                {"role": "system", "content": "你是严格的 RAG 评估专家，只输出 JSON。"},
+                {"role": "user", "content": eval_prompt},
+            ])
+
+            # 解析评估结果
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', eval_result, re.DOTALL)
+            scores = {"retrieval": 0, "groundedness": 0, "relevance": 0, "utilization": 0}
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group())
+                    for dim in ["retrieval", "groundedness", "relevance", "utilization"]:
+                        val = parsed.get(dim, {})
+                        if isinstance(val, dict):
+                            scores[dim] = round(float(val.get("score", 0)), 2)
+                        elif isinstance(val, (int, float)):
+                            scores[dim] = round(float(val), 2)
+                except Exception:
+                    pass
+
+            for dim in dimensions:
+                dimensions[dim].append(scores[dim])
+
+            results.append({
+                "q": tc["q"],
+                "bank": tc["bank"],
+                "answer_preview": answer[:200],
+                "chunks_recalled": len(recalled),
+                "scores": scores,
+                "eval_raw": eval_result[:500],
+            })
+
+        except Exception as e:
+            results.append({"q": tc["q"], "bank": tc["bank"], "error": str(e)[:200],
+                           "scores": {"retrieval": 0, "groundedness": 0, "relevance": 0, "utilization": 0}})
+
+    # 汇总
+    avg_scores = {}
+    for dim in dimensions:
+        vals = dimensions[dim]
+        avg_scores[dim] = round(sum(vals) / max(len(vals), 1), 2)
+
+    overall = round(sum(avg_scores.values()) / 4, 2)
+
+    return {
+        "total_cases": len(test_cases),
+        "evaluated": len([r for r in results if "error" not in r]),
+        "avg_scores": avg_scores,
+        "overall": overall,
+        "details": results,
+    }
+
+
 @app.get("/api/audit")
 async def audit_knowledge_base():
     """扫描知识库所有文档，输出质量检查报告"""
@@ -1758,6 +1997,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .standard-form.show{display:block}
 .audit-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
 .audit-form.show{display:block}
+.rag-eval-form{background:#fff;border-radius:12px;padding:24px;margin-bottom:16px;display:none;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.rag-eval-form.show{display:block}
 .form-group{margin-bottom:14px}
 .form-group label{display:block;font-size:13px;font-weight:600;color:#555;margin-bottom:6px}
 .form-group input,.form-group select{width:100%;padding:12px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none}
@@ -1818,6 +2059,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <button class="section-btn" id="btn-docs" onclick="toggleSection('docs')">📋 文档列表</button>
     <button class="section-btn" id="btn-standard" onclick="toggleSection('standard')">📥 规范下载</button>
     <button class="section-btn" id="btn-audit" onclick="toggleSection('audit')">🔍 数据自查</button>
+    <button class="section-btn" id="btn-rag-eval" onclick="toggleSection('rag-eval')">📊 RAG评估</button>
   </div>
 
   <div class="upload-form" id="upload-form">
@@ -1862,6 +2104,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="audit-form" id="audit-form">
     <button class="upload-btn" onclick="doAudit()" style="margin-bottom:14px">🔍 开始自查</button>
     <div id="audit-result"></div>
+  </div>
+
+  <div class="rag-eval-form" id="rag-eval-form">
+    <div style="margin-bottom:12px;">
+      <h3 style="margin:0 0 6px;">📊 RAG 效果评估（4维度）</h3>
+      <p style="color:#888;font-size:13px;margin:0;">基于 RAGAS 框架评估检索质量、可对应性、答案相关性和利用率</p>
+    </div>
+    <button class="upload-btn" onclick="loadRagEval()" style="margin-bottom:14px;background:#C85032;">🚀 开始评估</button>
+    <div id="rag-eval-status" style="margin-top:12px;color:#888;font-size:13px;"></div>
+    <div id="rag-eval-results" style="margin-top:16px;"></div>
   </div>
 
   <div id="doc-search-bar" style="display:none;margin-bottom:12px">
@@ -2040,9 +2292,11 @@ function toggleSection(name) {
       document.getElementById('doc-list').classList.remove('show');
       document.getElementById('standard-form').classList.remove('show');
       document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('rag-eval-form').classList.remove('show');
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('btn-rag-eval').classList.remove('active');
     }
   } else if (name === 'docs') {
     const list = document.getElementById('doc-list');
@@ -2052,9 +2306,11 @@ function toggleSection(name) {
       document.getElementById('upload-form').classList.remove('show');
       document.getElementById('standard-form').classList.remove('show');
       document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('rag-eval-form').classList.remove('show');
       document.getElementById('btn-upload').classList.remove('active');
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('btn-rag-eval').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'block';
       loadDocs();
     } else {
@@ -2068,9 +2324,11 @@ function toggleSection(name) {
       document.getElementById('upload-form').classList.remove('show');
       document.getElementById('doc-list').classList.remove('show');
       document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('rag-eval-form').classList.remove('show');
       document.getElementById('btn-upload').classList.remove('active');
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('btn-rag-eval').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'none';
       // Populate bank dropdown for standard form
       const stdBank = document.getElementById('std-bank');
@@ -2087,12 +2345,79 @@ function toggleSection(name) {
       document.getElementById('upload-form').classList.remove('show');
       document.getElementById('doc-list').classList.remove('show');
       document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('rag-eval-form').classList.remove('show');
       document.getElementById('btn-upload').classList.remove('active');
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('btn-rag-eval').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'none';
       doAudit();
     }
+  } else if (name === 'rag-eval') {
+    const ragForm = document.getElementById('rag-eval-form');
+    ragForm.classList.toggle('show');
+    document.getElementById('btn-rag-eval').classList.toggle('active', ragForm.classList.contains('show'));
+    if (ragForm.classList.contains('show')) {
+      document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('btn-docs').classList.remove('active');
+      document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('doc-search-bar').style.display = 'none';
+    }
+  }
+}
+
+async function loadRagEval() {
+  const status = document.getElementById('rag-eval-status');
+  const results = document.getElementById('rag-eval-results');
+  status.textContent = '⏳ 正在评估中（约1-2分钟）...';
+  results.innerHTML = '';
+  try {
+    const r = await fetch('/api/rag-eval');
+    const d = await r.json();
+    if (d.error) { status.textContent = '❌ ' + d.error; return; }
+
+    let html = '<div style="background:#f5f5f0;border-radius:8px;padding:16px;margin-bottom:12px;">';
+    html += '<div style="font-size:20px;font-weight:bold;margin-bottom:8px;">综合评分：' + (d.overall * 100).toFixed(0) + '%</div>';
+    html += '<div style="display:flex;gap:16px;flex-wrap:wrap;">';
+    const dimNames = {retrieval:'检索质量',groundedness:'可对应性',relevance:'答案相关性',utilization:'利用率'};
+    const dimColors = {retrieval:'#4CAF50',groundedness:'#2196F3',relevance:'#FF9800',utilization:'#9C27B0'};
+    for (const [k,v] of Object.entries(d.avg_scores)) {
+      const pct = (v * 100).toFixed(0);
+      html += '<div style="text-align:center;min-width:100px;">';
+      html += '<div style="font-size:24px;font-weight:bold;color:' + (dimColors[k]||'#333') + ';">' + pct + '%</div>';
+      html += '<div style="font-size:12px;color:#666;">' + (dimNames[k]||k) + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+    html += '<div style="font-size:12px;color:#888;margin-top:8px;">测试用例：' + d.total_cases + ' 个 | 成功评估：' + d.evaluated + ' 个</div>';
+    html += '</div>';
+
+    // 详细结果
+    html += '<div style="font-size:14px;font-weight:bold;margin:12px 0 8px;">详细结果</div>';
+    for (const item of d.details) {
+      const hasErr = !!item.error;
+      const bgColor = hasErr ? '#fff0f0' : '#fafafa';
+      html += '<div style="background:' + bgColor + ';border-radius:6px;padding:10px;margin-bottom:8px;font-size:13px;">';
+      html += '<div style="font-weight:bold;">' + (item.q||'') + ' <span style="color:#888;font-weight:normal;">[' + (item.bank||'') + ']</span></div>';
+      if (hasErr) {
+        html += '<div style="color:red;">错误：' + item.error + '</div>';
+      } else {
+        const s = item.scores || {};
+        html += '<div style="margin-top:4px;">检索:' + ((s.retrieval||0)*100).toFixed(0) + '% · 可对应:' + ((s.groundedness||0)*100).toFixed(0) + '% · 相关:' + ((s.relevance||0)*100).toFixed(0) + '% · 利用:' + ((s.utilization||0)*100).toFixed(0) + '%</div>';
+        html += '<div style="color:#666;margin-top:4px;">召回 ' + (item.chunks_recalled||0) + ' 条 | ' + (item.answer_preview||'').substring(0,100) + '...</div>';
+      }
+      html += '</div>';
+    }
+
+    results.innerHTML = html;
+    status.textContent = '';
+  } catch(e) {
+    status.textContent = '❌ 请求失败：' + e.message;
   }
 }
 
