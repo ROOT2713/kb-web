@@ -945,11 +945,8 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
                 doc_id = t[7:]
                 break
         if not doc_id:
-            # 技术类 bank 的记忆缺少 doc_id tag，不能丢弃
-            if bank in ("tech", "security", "ai", "notes"):
-                doc_id = f"_notag_{id(r)}"  # 伪造唯一 ID 用于分组
-            else:
-                continue
+            # Hindsight consolidation 后所有 bank 的记忆都可能丢失 doc_id tag，不能丢弃
+            doc_id = f"_notag_{id(r)}"  # 伪造唯一 ID 用于分组
         # 过滤 skip bank
         if bank_map.get(doc_id) == "skip":
             continue
