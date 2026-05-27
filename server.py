@@ -1035,11 +1035,12 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     
     prompt = f"""{bank_prompt}
 
-【硬性规则】
-1. 只使用下方「文档内容」中的信息回答，禁止使用你的训练知识补充任何事实
-2. 每个关键论断必须在括号内标注来源文档名称
-3. 文档中没有相关信息时，直接回答「根据现有资料无法确定，建议查阅原文」
-4. 多个文档存在矛盾时，列出不同说法并各自标注来源
+【回答原则】
+1. 以「文档内容」为主要依据，优先引用文档中的具体内容和数据
+2. 可以基于文档内容进行综合推理和归纳总结，但不得编造文档中不存在的具体数字、条款号或标准编号
+3. 每个关键论断标注来源文档名称
+4. 如果文档中完全没有相关信息（关键词完全不匹配），说明"当前知识库未收录相关内容，以下为一般性参考"，然后基于你的知识给出方向性建议
+5. 多个文档存在矛盾时，列出不同说法并各自标注来源
 
 基于以下文档内容回答问题：
 
@@ -1062,6 +1063,28 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     return {"answer": answer, "sources": sources}
 
 
+async def web_search(query: str, max_results: int = 3) -> str:
+    """通过 AnySearch CLI 联网搜索，返回格式化的搜索结果文本"""
+    try:
+        skill_dir = os.path.expanduser("~/.agents/skills/anysearch")
+        cli_path = os.path.join(skill_dir, "scripts", "anysearch_cli.py")
+        if not os.path.exists(cli_path):
+            return ""
+
+        proc = await asyncio.create_subprocess_exec(
+            "python3", cli_path, "search", query, "--max_results", str(max_results),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode == 0 and stdout:
+            return stdout.decode("utf-8", errors="replace").strip()
+        return ""
+    except Exception as e:
+        print(f"[WARN] web_search failed: {e}", flush=True)
+        return ""
+
+
 @app.post("/api/follow-up")
 async def follow_up(
     q: str = Form(...),
@@ -1069,12 +1092,18 @@ async def follow_up(
     context: str = Form(""),
     history: str = Form(""),
 ):
-    """追问 — 跳过检索，直接用页面上下文 + 对话历史问 DeepSeek"""
+    """追问 — 页面上下文 + 对话历史 + 联网搜索，综合回答"""
     if not q.strip():
         raise HTTPException(400, "问题不能为空")
 
     bank_cfg = get_bank_config(bank)
     bank_prompt = bank_cfg["prompt"]
+
+    # 联网搜索补充信息
+    web_results = await web_search(q, max_results=3)
+    web_context = ""
+    if web_results:
+        web_context = f"\n\n【联网搜索结果】\n{web_results}\n"
 
     prompt = f"""{bank_prompt}
 
@@ -1085,12 +1114,15 @@ async def follow_up(
 
 【对话历史】
 {history}
-
+{web_context}
 现在用户追问：
 {q}
 
-请基于上述上下文回答追问。如果上下文中没有足够信息，请如实说明。
-直接回答，不要重复上下文中已有的内容，除非需要引用。用中文回答。"""
+请综合以上所有信息（页面内容、对话历史、联网搜索结果）回答追问。
+- 优先使用页面已有的知识库内容
+- 如果页面信息不足，参考联网搜索结果补充
+- 如果都没有足够信息，基于你的知识给出方向性建议，并说明信息来源
+直接回答，不要重复已有的内容，除非需要引用。用中文回答。"""
 
     try:
         answer = await deepseek_chat([
@@ -1100,7 +1132,7 @@ async def follow_up(
     except Exception as e:
         answer = f"回答失败: {e}"
 
-    return {"answer": answer}
+    return {"answer": answer, "web_searched": bool(web_results)}
 
 
 @app.get("/api/documents/{doc_id}/content")
