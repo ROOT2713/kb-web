@@ -549,7 +549,12 @@ async def build_bm25_index(bank: str = "all") -> tuple:
     ]
     seen_texts = set()
     try:
-        tasks = [recall(q, limit=300, bank="kb", max_tokens=65536) for q in recall_queries]
+        # Build BM25 from ALL active Hindsight banks
+        active_banks = await _get_active_hindsight_banks()
+        tasks = []
+        for q in recall_queries:
+            for hs_bank in active_banks:
+                tasks.append(recall(q, limit=200, bank=hs_bank, max_tokens=65536))
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
         for results in results_list:
             if isinstance(results, Exception) or not results:
@@ -637,6 +642,31 @@ async def recall(query: str, limit: int = 5, bank: str = "kb", max_tokens: int =
         {"query": query, "max_tokens": max_tokens},
     )
     return result.get("results", [])
+
+# Cache for active Hindsight banks (refreshed every 5 minutes)
+_active_hs_banks_cache = {"banks": None, "ts": 0}
+_ACTIVE_HS_BANKS_TTL = 300  # 5 minutes
+
+async def _get_active_hindsight_banks(min_docs: int = 1) -> list:
+    """Discover which Hindsight banks have documents. Returns list of bank_ids."""
+    import time
+    now = time.time()
+    if _active_hs_banks_cache["banks"] and (now - _active_hs_banks_cache["ts"]) < _ACTIVE_HS_BANKS_TTL:
+        return _active_hs_banks_cache["banks"]
+    
+    try:
+        result = await hindsight_request("/v1/default/banks", timeout=10)
+        banks_data = result.get("banks", [])
+        active = [b["bank_id"] for b in banks_data if b.get("fact_count", 0) >= min_docs]
+        if not active:
+            active = ["kb"]  # fallback
+        _active_hs_banks_cache["banks"] = active
+        _active_hs_banks_cache["ts"] = now
+        print(f"Active Hindsight banks: {active}", file=sys.stderr)
+        return active
+    except Exception as e:
+        print(f"[WARN] Failed to discover Hindsight banks: {e}", file=sys.stderr)
+        return ["kb"]  # fallback
 
 def get_bank_config(bank_key: str) -> dict:
     """获取 bank 配置，不存在则返回默认"""
@@ -1538,14 +1568,16 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
         db.close()
 
     # ── Hybrid Search: Dense + BM25 RRF 融合 ──
-    raw_results = await recall(q, limit=25, bank="kb")
-    # "全部"模式增加召回深度
-    if bank == "all":
+    # Search ALL active Hindsight banks (not just "kb" which may be nearly empty)
+    active_banks = await _get_active_hindsight_banks()
+    all_recall_results = []
+    for hs_bank in active_banks:
         try:
-            extra = await recall(q, limit=15, bank="kb")
-            raw_results = extra + raw_results
+            bank_results = await recall(q, limit=20, bank=hs_bank)
+            all_recall_results.extend(bank_results)
         except Exception:
             pass
+    raw_results = all_recall_results if all_recall_results else await recall(q, limit=25, bank="kb")
 
     # BM25 关键词召回（补充语义召回的盲区）
     bm25_merged = raw_results  # 默认 fallback
