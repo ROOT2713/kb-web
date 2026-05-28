@@ -87,16 +87,29 @@ def init_db():
         print("DB: 已添加 content_hash 列", file=sys.stderr)
     except sqlite3.OperationalError:
         pass  # 列已存在
+    # doc_type 列（adaptive chunking 策略类型）
+    try:
+        db.execute("ALTER TABLE doc_meta ADD COLUMN doc_type TEXT DEFAULT 'generic'")
+        print("DB: 已添加 doc_type 列", file=sys.stderr)
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    # Parent-Child 分块表
+    db.execute("""CREATE TABLE IF NOT EXISTS parent_chunks (
+        doc_id TEXT,
+        parent_idx INTEGER,
+        parent_text TEXT,
+        PRIMARY KEY (doc_id, parent_idx)
+    )""")
     db.commit()
     db.close()
 
 init_db()
 
-def save_meta(doc_id: str, title: str, category: str, filename: str, content_hash: str = ""):
+def save_meta(doc_id: str, title: str, category: str, filename: str, content_hash: str = "", doc_type: str = "generic"):
     db = get_db()
     db.execute(
-        "INSERT OR REPLACE INTO doc_meta (doc_id, title, category, filename, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (doc_id, title, category, filename, content_hash, datetime.utcnow().isoformat()),
+        "INSERT OR REPLACE INTO doc_meta (doc_id, title, category, filename, content_hash, created_at, doc_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (doc_id, title, category, filename, content_hash, datetime.utcnow().isoformat(), doc_type),
     )
     db.commit()
     db.close()
@@ -688,8 +701,549 @@ def assess_quality(text: str) -> dict:
         "issues": issues,
     }
 
-# ─── API ──────────────────────────────────────────────────────
 
+# ─── Adaptive Chunking: Document Profiling ────────────────────────
+
+def profile_document(text: str) -> dict:
+    """Analyze document structure and return profiling info.
+
+    Returns:
+        {
+            "doc_type": "gb_standard" | "regulation" | "generic",
+            "headings": [(level: int, title: str, pos: int), ...],
+            "confidence": float  # 0.0 ~ 1.0
+        }
+    """
+    lines = text.split("\n")
+
+    # ── GB Standard detection ──
+    # Pattern: numbered headings like "## 4 总则", "## 5.1 xxx", "5.3.2 xxx"
+    # Also: appendix headings "## 附录A", "## A.1 xxx"
+    re_gb_md_heading = re.compile(r'^(#{1,4})\s+(\d+(?:\.\d+)*)\s+(.*)$')        # ## 4 总则
+    re_gb_raw_heading = re.compile(r'^(\d+(?:\.\d+)*)\s*(.{1,60})$')             # 4.1 总则 or 1范围 (no ##)
+    re_gb_appendix_md = re.compile(r'^(#{1,4})\s+(附录[A-Z])\s*(.*)$')           # ## 附录A
+    re_gb_appendix_sub = re.compile(r'^(#{1,4})\s+([A-Z]\.\d+)\s*(.*)$')         # ## A.1 xxx
+    re_gb_raw_appendix = re.compile(r'^([A-Z]\.\d+)\s+(.{1,60})$')               # A.1 xxx (no ##)
+
+    gb_headings = []
+    for i, line in enumerate(lines):
+        line_stripped = line.rstrip()
+        pos = sum(len(lines[j]) + 1 for j in range(i))  # byte offset in text
+
+        # Markdown numbered headings
+        m = re_gb_md_heading.match(line_stripped)
+        if m:
+            level = len(m.group(1))  # number of # characters
+            title = f"{m.group(2)} {m.group(3)}".strip()
+            gb_headings.append((level, title, pos))
+            continue
+
+        # Appendix markdown headings: ## 附录A
+        m = re_gb_appendix_md.match(line_stripped)
+        if m:
+            level = len(m.group(1))
+            title = f"{m.group(2)} {m.group(3)}".strip() if m.group(3) else m.group(2)
+            gb_headings.append((level, title, pos))
+            continue
+
+        # Appendix sub-headings markdown: ## A.1 xxx
+        m = re_gb_appendix_sub.match(line_stripped)
+        if m:
+            level = len(m.group(1))
+            title = f"{m.group(2)} {m.group(3)}".strip() if m.group(3) else m.group(2)
+            gb_headings.append((level, title, pos))
+            continue
+
+        # Raw numbered headings (no markdown prefix)
+        m = re_gb_raw_heading.match(line_stripped)
+        if m:
+            title = f"{m.group(1)} {m.group(2)}".strip()
+            gb_headings.append((1, title, pos))
+            continue
+
+        # Raw appendix sub-headings (no markdown prefix): A.1 xxx
+        m = re_gb_raw_appendix.match(line_stripped)
+        if m:
+            title = f"{m.group(1)} {m.group(2)}".strip()
+            gb_headings.append((1, title, pos))
+            continue
+
+    # ── Regulation detection ──
+    re_article_cn = re.compile(r'^第[一二三四五六七八九十百千零\d]+条')
+    re_article_num = re.compile(r'^第(\d+)条')
+    regulation_count = 0
+    regulation_headings = []
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        pos = sum(len(lines[j]) + 1 for j in range(i))
+        if re_article_cn.match(line_stripped) or re_article_num.match(line_stripped):
+            regulation_count += 1
+            # Extract article title (first 80 chars of the line)
+            title = line_stripped[:80]
+            regulation_headings.append((1, title, pos))
+
+    # ── Classification ──
+    # Count unique numbered sections (top-level like "1", "2", ... not sub-levels)
+    top_level_gb = len(set(h[1].split()[0].split('.')[0] for h in gb_headings if h[1]))
+    total_gb = len(gb_headings)
+
+    doc_type = "generic"
+    headings = []
+    confidence = 0.0
+
+    if total_gb >= 3:
+        doc_type = "gb_standard"
+        headings = gb_headings
+        confidence = min(1.0, total_gb / 10)
+    elif regulation_count >= 3:
+        doc_type = "regulation"
+        headings = regulation_headings
+        confidence = min(1.0, regulation_count / 10)
+
+    return {
+        "doc_type": doc_type,
+        "headings": headings,
+        "confidence": confidence,
+    }
+
+
+def heading_chunk(text: str, profile: dict, min_child_size: int = 200, max_parent_size: int = 3000) -> list:
+    """Split document by semantic headings. Returns same format as parent_child_chunk.
+
+    For gb_standard:
+      - child = content under each leaf heading (X.X.X or X.X level)
+      - parent = content under parent heading (X level), combining all its children
+      - If a child is too small (< min_child_size), merge with next sibling
+      - If a parent is too large (> max_parent_size), keep it as-is (don't split further)
+
+    For regulation:
+      - child = each article (第N条)
+      - parent = group of 3-5 consecutive articles
+
+    Returns same format as parent_child_chunk:
+    [{"child": str, "parent": str, "child_index": int, "parent_index": int, "section_hint": str}]
+    """
+    headings = profile.get("headings", [])
+    doc_type = profile.get("doc_type", "generic")
+
+    if not headings:
+        return []  # caller should fall back to parent_child_chunk
+
+    if doc_type == "gb_standard":
+        return _heading_chunk_gb(text, headings, min_child_size, max_parent_size)
+    elif doc_type == "regulation":
+        return _heading_chunk_regulation(text, headings)
+    else:
+        return []
+
+
+def _parse_section_number(title: str):
+    """Extract the numeric part from a heading title for level comparison.
+
+    Examples:
+        "4 总则" → (4,)
+        "5.1 xxx" → (5, 1)
+        "5.1.2 xxx" → (5, 1, 2)
+        "附录A xxx" → None (appendix)
+        "A.1 xxx" → None (appendix sub)
+    Returns tuple of ints or None.
+    """
+    m = re.match(r'(\d+(?:\.\d+)*)', title.strip())
+    if m:
+        return tuple(int(x) for x in m.group(1).split('.'))
+    return None
+
+
+def _heading_chunk_gb(text: str, headings: list, min_child_size: int = 200, max_parent_size: int = 3000) -> list:
+    """Heading-based chunking for GB standard documents."""
+    lines = text.split("\n")
+
+    # Compute byte offsets for each heading position
+    # (profile_document stores char offsets; we need to map to line-based splitting)
+    # Re-compute line-based positions from headings
+    # headings = [(level, title, pos), ...] where pos is approximate char offset
+
+    # Build sections: for each heading, find its line index
+    # We'll re-parse the text to find exact line indices of headings
+    re_numbered = re.compile(r'^(#{1,4})\s+(\d+(?:\.\d+)*)\s+(.*)$')
+    re_appendix_md = re.compile(r'^(#{1,4})\s+(附录[A-Z])\s*(.*)$')
+    re_appendix_sub = re.compile(r'^(#{1,4})\s+([A-Z]\.\d+)\s*(.*)$')
+    re_raw_numbered = re.compile(r'^(\d+(?:\.\d+)*)\s*(.{1,60})$')             # 4.1 总则 or 1范围 (no ##)
+    re_raw_appendix = re.compile(r'^([A-Z]\.\d+)\s+(.{1,60})$')
+
+    # Map each heading from profile to its line index
+    heading_lines = []  # [(line_idx, level, section_number_tuple, title)]
+    for level, title, _pos in headings:
+        # Find the matching line
+        for i, line in enumerate(lines):
+            line_stripped = line.rstrip()
+            matched = False
+            sec_num = None
+
+            m = re_numbered.match(line_stripped)
+            if m:
+                candidate_title = f"{m.group(2)} {m.group(3)}".strip()
+                if candidate_title == title or title.startswith(m.group(2)):
+                    sec_num = tuple(int(x) for x in m.group(2).split('.'))
+                    matched = True
+
+            if not matched:
+                m = re_appendix_md.match(line_stripped)
+                if m:
+                    candidate_title = f"{m.group(2)} {m.group(3)}".strip() if m.group(3) else m.group(2)
+                    if candidate_title == title or title.startswith(m.group(2)):
+                        matched = True
+
+            if not matched:
+                m = re_appendix_sub.match(line_stripped)
+                if m:
+                    candidate_title = f"{m.group(2)} {m.group(3)}".strip() if m.group(3) else m.group(2)
+                    if candidate_title == title or title.startswith(m.group(2)):
+                        matched = True
+
+            if not matched:
+                m = re_raw_numbered.match(line_stripped)
+                if m:
+                    candidate_title = f"{m.group(1)} {m.group(2)}".strip()
+                    if candidate_title == title or title.startswith(m.group(1)):
+                        sec_num = tuple(int(x) for x in m.group(1).split('.'))
+                        matched = True
+
+            if not matched:
+                m = re_raw_appendix.match(line_stripped)
+                if m:
+                    candidate_title = f"{m.group(1)} {m.group(2)}".strip()
+                    if candidate_title == title or title.startswith(m.group(1)):
+                        matched = True
+
+            if matched:
+                if sec_num is None:
+                    sec_num = _parse_section_number(title)
+                heading_lines.append((i, level, sec_num, title))
+                break
+
+    # Sort by line index
+    heading_lines.sort(key=lambda x: x[0])
+
+    # Post-process: assign synthetic sec_nums to appendix headings
+    # so they group correctly (e.g., 附录A → (1000,), A.1 → (1000, 1), 附录B → (1001,))
+    appendix_counter = [0]
+    last_appendix_id = [None]
+    re_appendix_title = re.compile(r'^附录([A-Z])')
+    re_appendix_sub_title = re.compile(r'^([A-Z])\.(\d+)')
+    updated_lines = []
+    for line_idx, level, sec_num, title in heading_lines:
+        if sec_num is None:
+            m = re_appendix_title.match(title)
+            if m:
+                appendix_counter[0] += 1
+                last_appendix_id[0] = appendix_counter[0]
+                sec_num = (1000 + appendix_counter[0],)
+            else:
+                m = re_appendix_sub_title.match(title)
+                if m and last_appendix_id[0] is not None:
+                    sub_num = int(m.group(2))
+                    sec_num = (1000 + last_appendix_id[0], sub_num)
+        updated_lines.append((line_idx, level, sec_num, title))
+    heading_lines = updated_lines
+
+    if not heading_lines:
+        return []
+
+    # Split text into sections based on heading positions
+    sections = []  # [(line_start, line_end, level, sec_num, title)]
+    # Text before first heading
+    if heading_lines[0][0] > 0:
+        sections.append((0, heading_lines[0][0], 0, None, "前言"))
+
+    for idx, (line_idx, level, sec_num, title) in enumerate(heading_lines):
+        end_line = heading_lines[idx + 1][0] if idx + 1 < len(heading_lines) else len(lines)
+        sections.append((line_idx, end_line, level, sec_num, title))
+
+    # Extract text for each section
+    section_texts = []
+    for line_start, line_end, level, sec_num, title in sections:
+        section_text = "\n".join(lines[line_start:line_end]).strip()
+        section_texts.append({
+            "text": section_text,
+            "level": level,
+            "sec_num": sec_num,
+            "title": title,
+            "line_start": line_start,
+        })
+
+    if not section_texts:
+        return []
+
+    # Determine leaf (child) and parent sections
+    # Strategy: sections with deeper sec_num (more dots) are children
+    # Sections with shallower sec_num are parents
+    # Text before first heading (sec_num=None) is a parent-only section
+
+    # Find the maximum depth of section numbers
+    all_sec_nums = [s["sec_num"] for s in section_texts if s["sec_num"] is not None]
+    if not all_sec_nums:
+        return []
+
+    max_depth = max(len(sn) for sn in all_sec_nums)
+
+    # Classify: if max_depth >= 2, deeper sections (len > 1) are children,
+    # top-level sections (len == 1 or None) are parents
+    # If max_depth == 1, all sections are both child and parent
+
+    # Build parent groups: group sections by their top-level number
+    parent_groups = {}  # top_level_number -> [section_indices]
+    current_top = None
+    for i, s in enumerate(section_texts):
+        if s["sec_num"] is not None:
+            top = s["sec_num"][0]
+            if top != current_top:
+                current_top = top
+            if current_top not in parent_groups:
+                parent_groups[current_top] = []
+            parent_groups[current_top].append(i)
+        else:
+            # Text before first heading — standalone parent
+            parent_groups[None] = [i]
+
+    # Merge small children
+    for top_level, indices in parent_groups.items():
+        if len(indices) <= 1:
+            continue
+        merged = []
+        for idx in indices:
+            if merged and len(section_texts[idx]["text"]) < min_child_size:
+                # Merge into previous
+                merged[-1] = idx
+            else:
+                merged.append(idx)
+        parent_groups[top_level] = merged
+
+    # Build chunks
+    results = []
+    child_index = 0
+    parent_index = 0
+
+    # Process sections in order
+    processed_parents = set()
+
+    for i, s in enumerate(section_texts):
+        top = s["sec_num"][0] if s["sec_num"] is not None else None
+        if top in processed_parents:
+            continue
+
+        if top is None:
+            # Pre-heading text: standalone parent
+            parent_text = s["text"]
+            if not parent_text.strip():
+                processed_parents.add(top)
+                continue
+
+            # This is a child under this parent
+            section_hint = s["title"][:80] if s["title"] else parent_text[:80]
+            # If child too small, merge into parent directly
+            if len(parent_text) < min_child_size and len(section_texts) > 1:
+                # Merge with next section's parent
+                next_i = i + 1
+                if next_i < len(section_texts):
+                    next_parent_text = "\n\n".join(
+                        section_texts[j]["text"] for j in parent_groups.get(
+                            section_texts[next_i]["sec_num"][0] if section_texts[next_i]["sec_num"] else None, []
+                        )
+                    )
+                    parent_text = parent_text + "\n\n" + next_parent_text[:max_parent_size]
+
+            results.append({
+                "child": parent_text[:800],
+                "parent": parent_text[:max_parent_size],
+                "child_index": child_index,
+                "parent_index": parent_index,
+                "section_hint": section_hint,
+            })
+            child_index += 1
+            parent_index += 1
+            processed_parents.add(top)
+            continue
+
+        # Get all sections under this parent
+        group_indices = parent_groups.get(top, [])
+        if not group_indices:
+            continue
+
+        # Check if this is a leaf section (no children)
+        is_leaf = max_depth == 1 or len(s["sec_num"]) == max_depth
+
+        if is_leaf and len(group_indices) == 1:
+            # Single leaf section: child = this section, parent = this section
+            parent_text = s["text"]
+            section_hint = s["title"][:80] if s["title"] else parent_text[:80]
+
+            results.append({
+                "child": parent_text[:800],
+                "parent": parent_text[:max_parent_size],
+                "child_index": child_index,
+                "parent_index": parent_index,
+                "section_hint": section_hint,
+            })
+            child_index += 1
+            parent_index += 1
+        else:
+            # Parent section with children
+            all_text = "\n\n".join(section_texts[j]["text"] for j in group_indices if section_texts[j]["text"].strip())
+            section_hint = s["title"][:80] if s["title"] else all_text[:80]
+
+            # Create child chunks from individual sections
+            for j in group_indices:
+                child_text = section_texts[j]["text"]
+                if not child_text.strip():
+                    continue
+                if len(child_text) < min_child_size:
+                    # Try to merge with next sibling
+                    next_j_idx = group_indices.index(j) + 1
+                    if next_j_idx < len(group_indices):
+                        next_j = group_indices[next_j_idx]
+                        child_text = child_text + "\n\n" + section_texts[next_j]["text"]
+                    if len(child_text) < min_child_size:
+                        # Still too small, use as-is
+                        pass
+
+                results.append({
+                    "child": child_text[:800],
+                    "parent": all_text[:max_parent_size],
+                    "child_index": child_index,
+                    "parent_index": parent_index,
+                    "section_hint": section_hint,
+                })
+                child_index += 1
+
+            parent_index += 1
+
+        processed_parents.add(top)
+
+    return results
+
+
+def _heading_chunk_regulation(text: str, headings: list) -> list:
+    """Heading-based chunking for regulation documents (article-based)."""
+    lines = text.split("\n")
+    re_article = re.compile(r'^(第[一二三四五六七八九十百千零\d]+条)')
+
+    # Find article line indices
+    article_lines = []
+    for level, title, _pos in headings:
+        for i, line in enumerate(lines):
+            if re.match(r'^' + re.escape(title[:5]).replace(r'\ ', ' ') , line.strip()):
+                article_lines.append((i, title))
+                break
+        else:
+            # Fallback: find by article number pattern
+            for i, line in enumerate(lines):
+                if re_article.match(line.strip()):
+                    article_lines.append((i, title))
+                    break
+
+    if not article_lines:
+        return []
+
+    # Sort by line index
+    article_lines.sort(key=lambda x: x[0])
+
+    # Split into article texts
+    article_texts = []
+    for idx, (line_idx, title) in enumerate(article_lines):
+        end_line = article_lines[idx + 1][0] if idx + 1 < len(article_lines) else len(lines)
+        article_text = "\n".join(lines[line_idx:end_line]).strip()
+        article_texts.append({"text": article_text, "title": title})
+
+    if not article_texts:
+        return []
+
+    # child = each article, parent = group of 3-5 articles
+    results = []
+    child_index = 0
+    parent_index = 0
+    group_size = 4  # articles per parent group
+
+    for i in range(0, len(article_texts), group_size):
+        group = article_texts[i:i + group_size]
+        parent_text = "\n\n".join(a["text"] for a in group)
+        section_hint = group[0]["title"][:80]
+
+        for a in group:
+            results.append({
+                "child": a["text"][:800],
+                "parent": parent_text,
+                "child_index": child_index,
+                "parent_index": parent_index,
+                "section_hint": section_hint,
+            })
+            child_index += 1
+
+        parent_index += 1
+
+    return results
+
+
+def parent_child_chunk(text: str, child_size: int = 384, parent_size: int = 2048, overlap: int = 80) -> list:
+    """将文本切分为父子分块。
+
+    返回 list of dict:
+    [
+        {
+            "child": "子块文本（用于向量匹配）",
+            "parent": "父块文本（用于LLM上下文）",
+            "child_index": 0,
+            "parent_index": 0,
+            "section_hint": "父块前80字符（章节提示）"
+        },
+        ...
+    ]
+    """
+    # Step 1: 按段落分割
+    paragraphs = text.split("\n\n")
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+    # Step 2: 聚合段落为父块（按 parent_size 滑动窗口）
+    parents = []
+    p_idx = 0
+    while p_idx < len(paragraphs):
+        parent_text = ""
+        while p_idx < len(paragraphs):
+            candidate = (parent_text + "\n\n" + paragraphs[p_idx]).strip() if parent_text else paragraphs[p_idx]
+            if len(candidate) > parent_size and parent_text:
+                break
+            parent_text = candidate
+            p_idx += 1
+        if parent_text:
+            parents.append(parent_text)
+
+    # Step 3: 在每个父块内切子块
+    results = []
+    child_index = 0
+    for p_idx, parent_text in enumerate(parents):
+        section_hint = parent_text[:80]
+        # 按 child_size 滑动窗口切子块（子块可以跨段落边界）
+        pos = 0
+        while pos < len(parent_text):
+            end = min(pos + child_size, len(parent_text))
+            child_text = parent_text[pos:end]
+            if child_text.strip():
+                results.append({
+                    "child": child_text,
+                    "parent": parent_text,
+                    "child_index": child_index,
+                    "parent_index": p_idx,
+                    "section_hint": section_hint,
+                })
+                child_index += 1
+            pos += child_size - overlap  # 带重叠的滑动窗口
+            if pos >= len(parent_text):
+                break
+
+    return results
+
+
+# ─── API ──────────────────────────────────────────────────────
 @app.post("/api/upload")
 async def upload(
     file: UploadFile = File(...),
@@ -711,6 +1265,7 @@ async def upload(
     content = await file.read()
     if len(content) == 0:
         raise HTTPException(400, "文件为空")
+
 
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, f"文件过大（{len(content)//1024//1024}MB），上限 {MAX_FILE_SIZE//1024//1024}MB")
@@ -758,25 +1313,59 @@ async def upload(
     doc_category = category.strip()
 
     # 分块存入 Hindsight（批量一次提交）
-    chunk_size = 1000
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    # ── Adaptive chunking: profile document first ──
+    profile = profile_document(text)
+    doc_type = profile.get("doc_type", "generic")
+    print(f"Document profile: type={doc_type}, confidence={profile.get('confidence', 0):.2f}, headings={len(profile.get('headings', []))}", file=sys.stderr)
+
+    if doc_type == "gb_standard" and profile.get("confidence", 0) >= 0.3:
+        pc_chunks = heading_chunk(text, profile)
+        if pc_chunks:
+            print(f"Heading-based chunking: {len(pc_chunks)} chunks", file=sys.stderr)
+        else:
+            # Fallback: heading parsing produced no chunks
+            doc_type = "generic"
+            pc_chunks = parent_child_chunk(text, child_size=384, parent_size=2048, overlap=80)
+            print(f"Heading chunking returned 0, fell back to paragraph: {len(pc_chunks)} chunks", file=sys.stderr)
+    elif doc_type == "regulation" and profile.get("confidence", 0) >= 0.3:
+        pc_chunks = heading_chunk(text, profile)
+        if pc_chunks:
+            print(f"Regulation-based chunking: {len(pc_chunks)} chunks", file=sys.stderr)
+        else:
+            doc_type = "generic"
+            pc_chunks = parent_child_chunk(text, child_size=384, parent_size=2048, overlap=80)
+            print(f"Regulation chunking returned 0, fell back to paragraph: {len(pc_chunks)} chunks", file=sys.stderr)
+    else:
+        pc_chunks = parent_child_chunk(text, child_size=384, parent_size=2048, overlap=80)
+        print(f"Paragraph-based chunking: {len(pc_chunks)} chunks", file=sys.stderr)
+
     doc_id = str(uuid.uuid4())
 
+    # 构建 parent 映射（用于查询时检索 parent 上下文）
+    parent_map = {}  # parent_index -> parent_text
+    for pc in pc_chunks:
+        parent_map[pc["parent_index"]] = pc["parent"]
+
     memory_items = []
-    for i, chunk in enumerate(chunks):
-        chunk = chunk.strip()
-        if not chunk:
+    for i, pc in enumerate(pc_chunks):
+        child_content = pc["child"].strip()
+        if not child_content:
             continue
+        # 子块内容加上 section hint 前缀提高匹配质量
+        enhanced_content = f"[{pc['section_hint']}] {child_content}" if pc["section_hint"] else child_content
+
         tags = [
             f"doc:{file.filename}",
-            f"chunk:{i+1}/{len(chunks)}",
+            f"chunk:{i+1}/{len(pc_chunks)}",
             f"doc_id:{doc_id}",
             f"title:{doc_title}",
             f"bank:{bank}",
+            f"parent_idx:{pc['parent_index']}",
+            f"strategy:{doc_type}",
         ]
         if doc_category:
             tags.append(f"cat:{doc_category}")
-        memory_items.append({"content": chunk, "tags": tags, "type": "world"})
+        memory_items.append({"content": enhanced_content, "tags": tags, "type": "world"})
 
     retained = 0
     hindsight_error = None
@@ -811,7 +1400,32 @@ async def upload(
         print(f"WARNING: Only {retained}/{len(memory_items)} chunks stored for doc {doc_id}", file=sys.stderr)
 
     # 保存元数据到 SQLite（含 bank 字段）
-    save_meta(doc_id, doc_title, doc_category, file.filename, content_hash)
+    save_meta(doc_id, doc_title, doc_category, file.filename, content_hash, doc_type)
+
+    # 保存 parent_map 到 SQLite（供查询时检索父块上下文）
+    try:
+        db = get_db()
+        for idx, ptext in parent_map.items():
+            db.execute("INSERT OR REPLACE INTO parent_chunks (doc_id, parent_idx, parent_text) VALUES (?, ?, ?)",
+                       (doc_id, idx, ptext))
+        db.commit()
+        db.close()
+        print(f"Saved {len(parent_map)} parent chunks for doc {doc_id}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: Failed to save parent_chunks for {doc_id}: {e}", file=sys.stderr)
+
+    # 保存PDF原件副本到备份目录（去重检查通过后才备份）
+    backup_dir = os.path.join(BASE_DIR, "storage", "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_name = file.filename or "unknown.pdf"
+    backup_path = os.path.join(backup_dir, backup_name)
+    try:
+        with open(backup_path, "wb") as bf:
+            bf.write(content)
+        print(f"Backup saved: {backup_path} ({len(content)//1024}KB)", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: PDF backup failed: {e}", file=sys.stderr)
+
     # 同时记录 bank 到 meta.db
     db = get_db()
     db.execute("UPDATE doc_meta SET bank = ? WHERE doc_id = ?", (bank, doc_id))
@@ -859,6 +1473,7 @@ async def upload(
             "needs_confirm": quality["score"] < 80,
         },
         "integrity": integrity,
+        "doc_type": doc_type,
     }
 
 
@@ -981,9 +1596,18 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
         if not cleaned:
             cleaned = text.strip()
         
+        # 提取 parent_idx（parent-child 分块机制）
+        parent_idx = None
+        for t in tags:
+            if t.startswith("parent_idx:"):
+                try:
+                    parent_idx = int(t.split(":", 1)[1])
+                except (ValueError, IndexError):
+                    pass
+                break
         if doc_id not in doc_facts:
             doc_facts[doc_id] = []
-        doc_facts[doc_id].append((text, doc_name, cleaned))
+        doc_facts[doc_id].append((text, doc_name, cleaned, parent_idx))
 
     if not doc_facts:
         return {"answer": "知识库中未找到相关信息。", "sources": []}
@@ -991,29 +1615,60 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     # ── 按文档合并：每个文档取 top-2 fact，拼接 ──
     context_parts = []
     sources = []
+
+    # ── 批量查询 parent 上下文 ──
+    parent_text_cache = {}  # (doc_id, parent_idx) -> parent_text
+    parent_keys_to_fetch = set()
+    for doc_id, facts in doc_facts.items():
+        for _, _, _, pidx in facts[:3]:
+            if pidx is not None:
+                parent_keys_to_fetch.add((doc_id, pidx))
+    if parent_keys_to_fetch:
+        try:
+            pdb = get_db()
+            for did, pidx in parent_keys_to_fetch:
+                row = pdb.execute("SELECT parent_text FROM parent_chunks WHERE doc_id=? AND parent_idx=?",
+                                  (did, pidx)).fetchone()
+                if row:
+                    parent_text_cache[(did, pidx)] = row[0]
+            pdb.close()
+        except Exception as e:
+            print(f"[WARN] parent_chunks query failed: {e}", file=sys.stderr)
     
     for doc_id, facts in doc_facts.items():
         # 取前 2 个 fact
         top_facts = facts[:3]
         doc_name = top_facts[0][1]
-        
-        # 合并同一文档的 fact（去重）
-        seen_texts = set()
-        merged = []
-        for _, _, cleaned in top_facts:
-            key = cleaned[:80]
-            if key not in seen_texts:
-                seen_texts.add(key)
-                merged.append(cleaned)
-        
-        if not merged:
-            continue
-        
-        combined = "；".join(merged)
+
+        # 尝试用 parent 上下文（更完整）替代 child（更碎片化）
+        parent_texts_for_doc = []
+        seen_parent = set()
+        for _, _, _, pidx in top_facts:
+            if pidx is not None and (doc_id, pidx) in parent_text_cache:
+                pt = parent_text_cache[(doc_id, pidx)]
+                if pt[:80] not in seen_parent:
+                    seen_parent.add(pt[:80])
+                    parent_texts_for_doc.append(pt)
+
+        if parent_texts_for_doc:
+            combined = "\n\n".join(parent_texts_for_doc[:3])
+        else:
+            # Fallback: 用 child 文本（去重合并）
+            seen_texts = set()
+            merged = []
+            for _, _, cleaned, _ in top_facts:
+                key = cleaned[:80]
+                if key not in seen_texts:
+                    seen_texts.add(key)
+                    merged.append(cleaned)
+            if not merged:
+                continue
+            combined = "；".join(merged)
+
         context_parts.append(f"[来源: {doc_name}]\n{combined}")
-        
-        # Merge all top facts' cleaned text (up to 800 chars)
-        merged_text = "；".join([c for _, _, c in facts[:3]])
+
+        # Merge all top facts' cleaned text (up to 800 chars) for sources display
+        merged_text = "；".join([c for _, _, c, _ in facts[:3]])
         sources.append({
             "doc": doc_name,
             "doc_id": doc_id if not doc_id.startswith("_notag_") else None,
@@ -1429,6 +2084,52 @@ async def patch_document_bank(doc_id: str, bank: str = Form(...)):
     db.close()
     return {"ok": True, "doc_id": doc_id, "bank": bank}
 
+
+@app.get("/api/wiki")
+async def wiki_tree(bank: str = "all"):
+    """返回知识库目录树结构，按 bank → category → documents 组织"""
+    db = get_db()
+    
+    if bank == "all":
+        rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at, doc_type FROM doc_meta WHERE bank NOT IN ('skip') ORDER BY bank, category, title"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT doc_id, title, category, filename, bank, created_at, doc_type FROM doc_meta WHERE bank = ? AND bank NOT IN ('skip') ORDER BY category, title",
+            (bank,)
+        ).fetchall()
+    db.close()
+    
+    # Build tree: bank → category → [documents]
+    tree = {}
+    bank_counts = {}
+    for r in rows:
+        b = r["bank"] or "kb"
+        cat = r["category"] or "未分类"
+        if b not in tree:
+            tree[b] = {}
+            bank_counts[b] = 0
+        if cat not in tree[b]:
+            tree[b][cat] = []
+        bank_counts[b] += 1
+        tree[b][cat].append({
+            "id": r["doc_id"],
+            "title": r["title"] or "未知文档",
+            "filename": r["filename"] or "",
+            "doc_type": r["doc_type"] or "generic",
+            "created": r["created_at"] or "",
+        })
+    
+    # Get bank names from config
+    bank_names = {k: v["name"] for k, v in BANKS.items() if k != "all"}
+    
+    return {
+        "tree": tree,
+        "bank_names": bank_names,
+        "bank_counts": bank_counts,
+        "total": len(rows),
+    }
 
 @app.get("/api/categories")
 async def list_categories():
@@ -2115,6 +2816,33 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .empty{text-align:center;padding:40px;color:#bbb;font-size:14px}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid #ddd;border-top-color:#e94560;border-radius:50%;animation:spin .6s linear infinite;margin-right:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
+.wiki-bank{margin-bottom:12px;border:1px solid #eee;border-radius:8px;overflow:hidden}
+.wiki-bank-header{display:flex;align-items:center;padding:12px 16px;cursor:pointer;user-select:none;background:#fafafa;border-bottom:1px solid #eee;transition:.2s}
+.wiki-bank-header:hover{background:#f0f0f0}
+.wiki-bank-header .icon{margin-right:8px;font-size:16px}
+.wiki-bank-header .name{font-weight:600;font-size:14px;flex:1}
+.wiki-bank-header .count{color:#888;font-size:12px;padding:2px 8px;background:#f0f0f0;border-radius:10px}
+.wiki-bank-header .arrow{color:#aaa;transition:.2s;font-size:12px}
+.wiki-bank.open>.wiki-bank-header .arrow{transform:rotate(90deg)}
+.wiki-bank-body{display:none;padding:8px 0}
+.wiki-bank.open>.wiki-bank-body{display:block}
+.wiki-cat{padding:4px 0}
+.wiki-cat-header{display:flex;align-items:center;padding:8px 16px;cursor:pointer;font-size:13px;color:#666;transition:.2s}
+.wiki-cat-header:hover{background:#f8f8f8}
+.wiki-cat-header .cat-icon{margin-right:6px}
+.wiki-cat-header .cat-name{flex:1;font-weight:500}
+.wiki-cat-header .cat-count{color:#aaa;font-size:11px}
+.wiki-cat-header .cat-arrow{color:#ccc;font-size:11px;margin-left:4px;transition:.2s}
+.wiki-cat.open>.wiki-cat-header .cat-arrow{transform:rotate(90deg)}
+.wiki-cat-body{display:none;padding-left:32px}
+.wiki-cat.open>.wiki-cat-body{display:block}
+.wiki-doc{padding:8px 16px;font-size:13px;color:#444;display:flex;align-items:center;gap:8px;cursor:pointer;border-radius:4px;margin:2px 8px;transition:.15s}
+.wiki-doc:hover{background:#f5f5f5;color:#e94560}
+.wiki-doc .doc-icon{font-size:14px}
+.wiki-doc .doc-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wiki-doc .doc-type{font-size:10px;padding:1px 6px;border-radius:8px;background:#f0f0f0;color:#888}
+.wiki-doc-content{background:#f8f8f8;border-radius:8px;padding:16px;margin:8px 16px 16px 48px;font-size:13px;line-height:1.8;white-space:pre-wrap;max-height:500px;overflow-y:auto;display:none;border:1px solid #eee}
+.wiki-doc-content.show{display:block}
 </style>
 </head>
 <body>
@@ -2143,6 +2871,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <button class="section-btn" id="btn-standard" onclick="toggleSection('standard')">📥 规范下载</button>
     <button class="section-btn" id="btn-audit" onclick="toggleSection('audit')">🔍 数据自查</button>
     <button class="section-btn" id="btn-rag-eval" onclick="toggleSection('rag-eval')">📊 RAG评估</button>
+    <button class="section-btn" id="btn-wiki" onclick="toggleSection('wiki')">📚 知识浏览</button>
   </div>
 
   <div class="upload-form" id="upload-form">
@@ -2197,6 +2926,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <button class="upload-btn" onclick="loadRagEval()" style="margin-bottom:14px;background:#C85032;">🚀 开始评估</button>
     <div id="rag-eval-status" style="margin-top:12px;color:#888;font-size:13px;"></div>
     <div id="rag-eval-results" style="margin-top:16px;"></div>
+  </div>
+
+  <div id="wiki-section" style="display:none">
+    <div style="background:#fff;border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.05)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0;font-size:16px">📚 知识库目录</h3>
+        <span id="wiki-count" style="color:#888;font-size:12px"></span>
+      </div>
+      <div id="wiki-tree" class="wiki-tree"></div>
+    </div>
   </div>
 
   <div id="doc-search-bar" style="display:none;margin-bottom:12px">
@@ -2352,6 +3091,8 @@ function toggleSection(name) {
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
       document.getElementById('btn-rag-eval').classList.remove('active');
+      document.getElementById('wiki-section').style.display = 'none';
+      document.getElementById('btn-wiki').classList.remove('active');
     }
   } else if (name === 'docs') {
     const list = document.getElementById('doc-list');
@@ -2366,6 +3107,8 @@ function toggleSection(name) {
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
       document.getElementById('btn-rag-eval').classList.remove('active');
+      document.getElementById('wiki-section').style.display = 'none';
+      document.getElementById('btn-wiki').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'block';
       loadDocs();
     } else {
@@ -2384,6 +3127,8 @@ function toggleSection(name) {
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
       document.getElementById('btn-rag-eval').classList.remove('active');
+      document.getElementById('wiki-section').style.display = 'none';
+      document.getElementById('btn-wiki').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'none';
       // Populate bank dropdown for standard form
       const stdBank = document.getElementById('std-bank');
@@ -2405,6 +3150,8 @@ function toggleSection(name) {
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-rag-eval').classList.remove('active');
+      document.getElementById('wiki-section').style.display = 'none';
+      document.getElementById('btn-wiki').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'none';
       doAudit();
     }
@@ -2421,7 +3168,27 @@ function toggleSection(name) {
       document.getElementById('btn-docs').classList.remove('active');
       document.getElementById('btn-standard').classList.remove('active');
       document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('wiki-section').style.display = 'none';
+      document.getElementById('btn-wiki').classList.remove('active');
       document.getElementById('doc-search-bar').style.display = 'none';
+    }
+  } else if (name === 'wiki') {
+    const wikiSection = document.getElementById('wiki-section');
+    wikiSection.style.display = wikiSection.style.display === 'none' ? 'block' : 'none';
+    document.getElementById('btn-wiki').classList.toggle('active', wikiSection.style.display === 'block');
+    if (wikiSection.style.display === 'block') {
+      document.getElementById('upload-form').classList.remove('show');
+      document.getElementById('doc-list').classList.remove('show');
+      document.getElementById('standard-form').classList.remove('show');
+      document.getElementById('audit-form').classList.remove('show');
+      document.getElementById('rag-eval-form').classList.remove('show');
+      document.getElementById('btn-upload').classList.remove('active');
+      document.getElementById('btn-docs').classList.remove('active');
+      document.getElementById('btn-standard').classList.remove('active');
+      document.getElementById('btn-audit').classList.remove('active');
+      document.getElementById('btn-rag-eval').classList.remove('active');
+      document.getElementById('doc-search-bar').style.display = 'none';
+      loadWiki();
     }
   }
 }
@@ -2473,6 +3240,154 @@ async function loadRagEval() {
     status.textContent = '';
   } catch(e) {
     status.textContent = '❌ 请求失败：' + e.message;
+  }
+}
+let wikiData = null;
+
+async function loadWiki() {
+  const treeDiv = document.getElementById('wiki-tree');
+  const countSpan = document.getElementById('wiki-count');
+  treeDiv.innerHTML = '<div class="loading"><span class="spin"></span>加载目录...</div>';
+  
+  try {
+    const r = await fetch('/api/wiki?bank=' + encodeURIComponent(currentBank));
+    const data = await r.json();
+    wikiData = data;
+    countSpan.textContent = '共 ' + data.total + ' 个文档';
+    
+    if (data.total === 0) {
+      treeDiv.innerHTML = '<div class="empty">📭 暂无文档</div>';
+      return;
+    }
+    
+    let html = '';
+    const bankOrder = ['kb', 'standards', 'industry_docs', 'tech', 'proposals', 'assessment', 'ai', 'notes', 'projects', 'general'];
+    const bankIcons = {'kb':'📚','standards':'📏','industry_docs':'📄','tech':'💻','proposals':'📝','assessment':'🔍','ai':'🤖','notes':'📝','projects':'📋','general':'📦'};
+    
+    // Show banks in order, then any remaining
+    const shownBanks = new Set();
+    for (const b of bankOrder) {
+      if (!data.tree[b]) continue;
+      shownBanks.add(b);
+      const bankName = data.bank_names[b] || b;
+      const count = data.bank_counts[b] || 0;
+      const icon = bankIcons[b] || '📁';
+      
+      html += '<div class="wiki-bank" id="wiki-bank-' + b + '">';
+      html += '<div class="wiki-bank-header" onclick="toggleWikiBank(\'' + b + '\')">';
+      html += '<span class="icon">' + icon + '</span>';
+      html += '<span class="name">' + bankName + '</span>';
+      html += '<span class="count">' + count + ' 文档</span>';
+      html += '<span class="arrow">▶</span>';
+      html += '</div>';
+      html += '<div class="wiki-bank-body">';
+      
+      const cats = data.tree[b];
+      const catNames = Object.keys(cats).sort();
+      for (const cat of catNames) {
+        const docs = cats[cat];
+        html += '<div class="wiki-cat" id="wiki-cat-' + b + '-' + cat.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '') + '">';
+        html += '<div class="wiki-cat-header" onclick="toggleWikiCat(this.parentElement)">';
+        html += '<span class="cat-icon">📁</span>';
+        html += '<span class="cat-name">' + cat + '</span>';
+        html += '<span class="cat-count">' + docs.length + '</span>';
+        html += '<span class="cat-arrow">▶</span>';
+        html += '</div>';
+        html += '<div class="wiki-cat-body">';
+        
+        for (const doc of docs) {
+          const typeLabel = doc.doc_type === 'gb_standard' ? 'GB标准' : 
+                           doc.doc_type === 'regulation' ? '法规' : '';
+          html += '<div class="wiki-doc" onclick="toggleWikiDoc(this, \'' + doc.id + '\')">';
+          html += '<span class="doc-icon">' + (doc.doc_type === 'gb_standard' ? '📏' : doc.doc_type === 'regulation' ? '⚖️' : '📄') + '</span>';
+          html += '<span class="doc-title">' + doc.title.replace(/</g, '&lt;') + '</span>';
+          if (typeLabel) html += '<span class="doc-type">' + typeLabel + '</span>';
+          html += '</div>';
+          html += '<div class="wiki-doc-content" id="wiki-doc-' + doc.id + '"></div>';
+        }
+        
+        html += '</div></div>';
+      }
+      
+      html += '</div></div>';
+    }
+    
+    // Show any remaining banks not in the predefined order
+    for (const b of Object.keys(data.tree)) {
+      if (shownBanks.has(b)) continue;
+      const bankName = data.bank_names[b] || b;
+      const count = data.bank_counts[b] || 0;
+      html += '<div class="wiki-bank" id="wiki-bank-' + b + '">';
+      html += '<div class="wiki-bank-header" onclick="toggleWikiBank(\'' + b + '\')">';
+      html += '<span class="icon">📁</span>';
+      html += '<span class="name">' + bankName + '</span>';
+      html += '<span class="count">' + count + ' 文档</span>';
+      html += '<span class="arrow">▶</span>';
+      html += '</div>';
+      html += '<div class="wiki-bank-body">';
+      const cats = data.tree[b];
+      for (const cat of Object.keys(cats).sort()) {
+        const docs = cats[cat];
+        html += '<div class="wiki-cat">';
+        html += '<div class="wiki-cat-header" onclick="toggleWikiCat(this.parentElement)">';
+        html += '<span class="cat-icon">📁</span>';
+        html += '<span class="cat-name">' + cat + '</span>';
+        html += '<span class="cat-count">' + docs.length + '</span>';
+        html += '<span class="cat-arrow">▶</span>';
+        html += '</div>';
+        html += '<div class="wiki-cat-body">';
+        for (const doc of docs) {
+          const typeLabel = doc.doc_type === 'gb_standard' ? 'GB标准' : doc.doc_type === 'regulation' ? '法规' : '';
+          html += '<div class="wiki-doc" onclick="toggleWikiDoc(this, \'' + doc.id + '\')">';
+          html += '<span class="doc-icon">📄</span>';
+          html += '<span class="doc-title">' + doc.title.replace(/</g, '&lt;') + '</span>';
+          if (typeLabel) html += '<span class="doc-type">' + typeLabel + '</span>';
+          html += '</div>';
+          html += '<div class="wiki-doc-content" id="wiki-doc-' + doc.id + '"></div>';
+        }
+        html += '</div></div>';
+      }
+      html += '</div></div>';
+    }
+    
+    treeDiv.innerHTML = html;
+  } catch(e) {
+    treeDiv.innerHTML = '<div class="result-msg error">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function toggleWikiBank(bankId) {
+  const el = document.getElementById('wiki-bank-' + bankId);
+  if (el) el.classList.toggle('open');
+}
+
+function toggleWikiCat(el) {
+  el.classList.toggle('open');
+}
+
+async function toggleWikiDoc(el, docId) {
+  const contentDiv = document.getElementById('wiki-doc-' + docId);
+  if (!contentDiv) return;
+  
+  if (contentDiv.classList.contains('show')) {
+    contentDiv.classList.remove('show');
+    return;
+  }
+  
+  contentDiv.classList.add('show');
+  contentDiv.innerHTML = '<div class="loading"><span class="spin"></span>加载文档内容...</div>';
+  
+  try {
+    const r = await fetch('/api/documents/' + docId + '/content');
+    const d = await r.json();
+    if (!d.text) {
+      contentDiv.innerHTML = '<div class="result-msg error">' + (d.detail || '内容未找到') + '</div>';
+      return;
+    }
+    const safeText = d.text.replace(/</g, '&lt;');
+    contentDiv.innerHTML = '<strong>📄 ' + (d.title || '未知').replace(/</g, '&lt;') + '</strong>（' + d.chunks + ' 个片段，' + d.text.length + ' 字符）<hr style="border-color:#eee;margin:6px 0">' + safeText.substring(0, 5000) + (d.text.length > 5000 ? '<br><em style="color:#888">...（仅显示前5000字符）</em>' : '');
+  } catch(e) {
+    contentDiv.innerHTML = '<div class="result-msg error">加载失败: ' + e.message + '</div>';
   }
 }
 
