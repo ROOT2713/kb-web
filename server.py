@@ -3274,7 +3274,7 @@ async function loadWiki() {
       const icon = bankIcons[b] || '📁';
       
       html += '<div class="wiki-bank" id="wiki-bank-' + b + '">';
-      html += '<div class="wiki-bank-header" onclick="toggleWikiBank(\'' + b + '\')">';
+      html += '<div class="wiki-bank-header" data-bank="' + b + '">';
       html += '<span class="icon">' + icon + '</span>';
       html += '<span class="name">' + bankName + '</span>';
       html += '<span class="count">' + count + ' 文档</span>';
@@ -3287,7 +3287,7 @@ async function loadWiki() {
       for (const cat of catNames) {
         const docs = cats[cat];
         html += '<div class="wiki-cat" id="wiki-cat-' + b + '-' + cat.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '') + '">';
-        html += '<div class="wiki-cat-header" onclick="toggleWikiCat(this.parentElement)">';
+        html += '<div class="wiki-cat-header" data-cat="' + cat + '">';
         html += '<span class="cat-icon">📁</span>';
         html += '<span class="cat-name">' + cat + '</span>';
         html += '<span class="cat-count">' + docs.length + '</span>';
@@ -3298,7 +3298,7 @@ async function loadWiki() {
         for (const doc of docs) {
           const typeLabel = doc.doc_type === 'gb_standard' ? 'GB标准' : 
                            doc.doc_type === 'regulation' ? '法规' : '';
-          html += '<div class="wiki-doc" onclick="toggleWikiDoc(this, \'' + doc.id + '\')">';
+          html += '<div class="wiki-doc" data-docid="' + doc.id + '">';
           html += '<span class="doc-icon">' + (doc.doc_type === 'gb_standard' ? '📏' : doc.doc_type === 'regulation' ? '⚖️' : '📄') + '</span>';
           html += '<span class="doc-title">' + doc.title.replace(/</g, '&lt;') + '</span>';
           if (typeLabel) html += '<span class="doc-type">' + typeLabel + '</span>';
@@ -3318,7 +3318,7 @@ async function loadWiki() {
       const bankName = data.bank_names[b] || b;
       const count = data.bank_counts[b] || 0;
       html += '<div class="wiki-bank" id="wiki-bank-' + b + '">';
-      html += '<div class="wiki-bank-header" onclick="toggleWikiBank(\'' + b + '\')">';
+      html += '<div class="wiki-bank-header" data-bank="' + b + '">';
       html += '<span class="icon">📁</span>';
       html += '<span class="name">' + bankName + '</span>';
       html += '<span class="count">' + count + ' 文档</span>';
@@ -3329,7 +3329,7 @@ async function loadWiki() {
       for (const cat of Object.keys(cats).sort()) {
         const docs = cats[cat];
         html += '<div class="wiki-cat">';
-        html += '<div class="wiki-cat-header" onclick="toggleWikiCat(this.parentElement)">';
+        html += '<div class="wiki-cat-header" data-cat="' + cat + '">';
         html += '<span class="cat-icon">📁</span>';
         html += '<span class="cat-name">' + cat + '</span>';
         html += '<span class="cat-count">' + docs.length + '</span>';
@@ -3338,7 +3338,7 @@ async function loadWiki() {
         html += '<div class="wiki-cat-body">';
         for (const doc of docs) {
           const typeLabel = doc.doc_type === 'gb_standard' ? 'GB标准' : doc.doc_type === 'regulation' ? '法规' : '';
-          html += '<div class="wiki-doc" onclick="toggleWikiDoc(this, \'' + doc.id + '\')">';
+          html += '<div class="wiki-doc" data-docid="' + doc.id + '">';
           html += '<span class="doc-icon">📄</span>';
           html += '<span class="doc-title">' + doc.title.replace(/</g, '&lt;') + '</span>';
           if (typeLabel) html += '<span class="doc-type">' + typeLabel + '</span>';
@@ -3351,6 +3351,15 @@ async function loadWiki() {
     }
     
     treeDiv.innerHTML = html;
+    // Event delegation for wiki tree clicks
+    treeDiv.addEventListener('click', function(e) {
+      var bankHeader = e.target.closest('.wiki-bank-header[data-bank]');
+      if (bankHeader) { toggleWikiBank(bankHeader.getAttribute('data-bank')); return; }
+      var catHeader = e.target.closest('.wiki-cat-header[data-cat]');
+      if (catHeader) { toggleWikiCat(catHeader.parentElement); return; }
+      var docEl = e.target.closest('.wiki-doc[data-docid]');
+      if (docEl) { toggleWikiDoc(docEl, docEl.getAttribute('data-docid')); return; }
+    });
   } catch(e) {
     treeDiv.innerHTML = '<div class="result-msg error">加载失败: ' + e.message + '</div>';
   }
