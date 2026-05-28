@@ -28,9 +28,9 @@ if os.path.exists(ENV_FILE):
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_KEY = os.environ.get("XIAOMI_API_KEY", "")
+DEEPSEEK_BASE = os.environ.get("XIAOMI_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")
+DEEPSEEK_MODEL = "mimo-v2.5"
 HINDSIGHT_URL = "http://localhost:8888"
 KB_BANK = "kb"  # 默认 bank（兼容旧数据，"全部"查询时用）
 
@@ -522,39 +522,52 @@ def _tokenize(text: str) -> list:
     return [w for w in jieba.cut(text) if len(w.strip()) > 1]
 
 async def build_bm25_index(bank: str = "all") -> tuple:
-    """从 Hindsight 加载全部 facts 构建 BM25 索引（带缓存）"""
+    """通过多组 recall 查询获取全部 chunks 构建 BM25 索引（带缓存）"""
     import time
     now = time.time()
     if _bm25_cache["index"] and _bm25_cache["bank"] == bank and (now - _bm25_cache["ts"]) < _BM25_TTL:
         return _bm25_cache["index"], _bm25_cache["docs"]
 
-    # 从 Hindsight 大 limit 召回获取全部 facts
-    all_facts = await recall("", limit=100, bank="kb", max_tokens=65536)  # 空 query 拿全部
-    
-    # 如果空 query 不返回结果，用常见词触发
-    if not all_facts:
-        all_facts = await recall("政务信息化 标准 规范", limit=100, bank="kb", max_tokens=65536)
-    
     docs = []
-    for r in all_facts:
-        text = r.get("text", "") or ""
-        tags = r.get("tags", [])
-        doc_id = None
-        for t in tags:
-            if t.startswith("doc_id:"):
-                doc_id = t[7:]
-                break
-        if text.strip():
-            docs.append({"text": text, "doc_id": doc_id or "_unknown_", "tags": tags})
-    
+    # 使用多组通用查询并行召回，覆盖更多 chunks
+    recall_queries = [
+        "标准 规范", "安全 系统", "工程 技术", "设计 施工",
+        "检测 验收", "网络 安全", "信息 系统", "监控 设备",
+    ]
+    seen_texts = set()
+    try:
+        tasks = [recall(q, limit=300, bank="kb", max_tokens=65536) for q in recall_queries]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        for results in results_list:
+            if isinstance(results, Exception) or not results:
+                continue
+            for r in results:
+                text = r.get("text", "") or ""
+                if not text.strip():
+                    continue
+                # 去重：取前 80 字符作为 key
+                dedup_key = text[:80]
+                if dedup_key in seen_texts:
+                    continue
+                seen_texts.add(dedup_key)
+                tags = r.get("tags", [])
+                doc_id = None
+                for t in tags:
+                    if t.startswith("doc_id:"):
+                        doc_id = t[7:]
+                        break
+                docs.append({"text": text, "doc_id": doc_id or "_unknown_", "tags": tags})
+    except Exception as e:
+        print(f"[WARN] BM25 recall failed: {e}", flush=True)
+
     if not docs:
         return None, []
-    
-    # 构建 BM25 索引
+
     tokenized = [_tokenize(d["text"]) for d in docs]
     bm25 = BM25Okapi(tokenized)
-    
+
     _bm25_cache.update({"index": bm25, "docs": docs, "bank": bank, "ts": now})
+    print(f"BM25 index built: {len(docs)} chunks (from {len(recall_queries)} queries)", flush=True)
     return bm25, docs
 
 def bm25_search(query: str, bm25, docs: list, top_k: int = 10) -> list:
@@ -704,6 +717,8 @@ async def upload(
 
     try:
         text = await parse_document(file.filename, content)
+        # 清除空字节，PostgreSQL UTF8 不接受 0x00
+        text = text.replace("\x00", "")
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -922,7 +937,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     try:
         bm25_index, bm25_docs = await build_bm25_index(bank)
         if bm25_index:
-            bm25_hits = bm25_search(q, bm25_index, bm25_docs, top_k=15)
+            bm25_hits = bm25_search(q, bm25_index, bm25_docs, top_k=20)
             if bm25_hits:
                 bm25_merged = rrf_merge(raw_results, bm25_hits, k=60)
     except Exception as e:
@@ -979,7 +994,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     
     for doc_id, facts in doc_facts.items():
         # 取前 2 个 fact
-        top_facts = facts[:2]
+        top_facts = facts[:3]
         doc_name = top_facts[0][1]
         
         # 合并同一文档的 fact（去重）
@@ -998,7 +1013,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
         context_parts.append(f"[来源: {doc_name}]\n{combined}")
         
         # Merge all top facts' cleaned text (up to 800 chars)
-        merged_text = "；".join([c for _, _, c in facts[:2]])
+        merged_text = "；".join([c for _, _, c in facts[:3]])
         sources.append({
             "doc": doc_name,
             "doc_id": doc_id if not doc_id.startswith("_notag_") else None,
@@ -1008,7 +1023,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
     
     # ── 限制 context 总量 ──
     total_chars = sum(len(p) for p in context_parts)
-    if total_chars > 8000:
+    if total_chars > 10000:
         # 按序截断
         kept = []
         chars = 0
@@ -1020,7 +1035,7 @@ async def query(q: str = Form(...), bank: str = Form("all"), history: str = Form
         context_parts = kept
     
     context = "\n\n---\n\n".join(context_parts)
-    sources = sources[:10]
+    sources = sources[:12]
 
     # ── 追问上下文注入 ──
     history_context = ""
@@ -1082,44 +1097,40 @@ async def web_search(query: str, max_results: int = 3) -> str:
         return ""
 
 
-@app.post("/api/follow-up")
-async def follow_up(
+@app.post("/api/web-search")
+async def web_search_api(
     q: str = Form(...),
     bank: str = Form("all"),
     context: str = Form(""),
-    history: str = Form(""),
 ):
-    """追问 — 页面上下文 + 对话历史 + 联网搜索，综合回答"""
+    """联网搜索 — 用户对知识库结果不满意时，结合页面上下文联网搜索回答"""
     if not q.strip():
         raise HTTPException(400, "问题不能为空")
 
     bank_cfg = get_bank_config(bank)
     bank_prompt = bank_cfg["prompt"]
 
-    # 联网搜索补充信息
-    web_results = await web_search(q, max_results=3)
+    # 联网搜索
+    web_results = await web_search(q, max_results=5)
     web_context = ""
     if web_results:
         web_context = f"\n\n【联网搜索结果】\n{web_results}\n"
 
     prompt = f"""{bank_prompt}
 
-你正在一个知识库问答系统的追问模式中。用户之前已经搜索过，以下是当前页面的完整信息：
+用户在一个知识库问答系统中搜索了以下问题，但对知识库返回的结果不满意，需要联网搜索补充。
 
-【当前页面的答案和来源】
-{context}
-
-【对话历史】
-{history}
-{web_context}
-现在用户追问：
+【用户原始问题】
 {q}
 
-请综合以上所有信息（页面内容、对话历史、联网搜索结果）回答追问。
-- 优先使用页面已有的知识库内容
-- 如果页面信息不足，参考联网搜索结果补充
-- 如果都没有足够信息，基于你的知识给出方向性建议，并说明信息来源
-直接回答，不要重复已有的内容，除非需要引用。用中文回答。"""
+【当前页面已有的知识库答案】
+{context[:3000] if context else '(无)'}
+{web_context}
+请综合以上信息，优先参考联网搜索结果，结合知识库已有内容，给出完整、准确的回答。
+- 引用具体条款和数据
+- 标注信息来源
+- 如果联网搜索也没有找到，基于你的知识给出方向性建议
+直接回答，用中文。"""
 
     try:
         answer = await deepseek_chat([
@@ -1127,7 +1138,7 @@ async def follow_up(
             {"role": "user", "content": prompt},
         ])
     except Exception as e:
-        answer = f"回答失败: {e}"
+        answer = f"联网搜索回答失败: {e}"
 
     return {"answer": answer, "web_searched": bool(web_results)}
 
@@ -1544,6 +1555,8 @@ async def reparse_document(doc_id: str):
     # 重新解析
     try:
         text = await parse_document(filename, content)
+        # 清除空字节，PostgreSQL UTF8 不接受 0x00
+        text = text.replace("\x00", "")
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -2197,7 +2210,6 @@ let currentBank = 'all';
 let selectedFile = null;
 let allDocs = [];
 let bankData = [];
-let conversationHistory = [];  // [{q, a}] for follow-up
 
 async function init() {
   await loadBanks();
@@ -2245,8 +2257,6 @@ function resetAll() {
   document.getElementById('answer-area').innerHTML = '';
   document.getElementById('query').value = '';
   document.getElementById('query').focus();
-  // Clear conversation history
-  conversationHistory = [];
 }
 
 async function doSearch() {
@@ -2257,26 +2267,16 @@ async function doSearch() {
   
   try {
     const fd = new FormData(); fd.append('q', q); fd.append('bank', currentBank);
-    // Append conversation history if exists
-    if (conversationHistory.length > 0) {
-      const NL = String.fromCharCode(10); const histText = conversationHistory.map(h => '问：' + h.q + NL + '答：' + h.a).join(NL + NL);
-      fd.append('history', histText);
-    }
     const r = await fetch('/api/query', {method:'POST', body:fd});
     const d = await r.json();
     const bankName = (bankData.find(b => b.key === currentBank) || {}).name || currentBank;
     
-    // Store in conversation history
-    conversationHistory.push({q: q, a: d.answer});
-    // Keep only last 3 turns
-    if (conversationHistory.length > 3) conversationHistory.shift();
-    
-    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+bankName+'</span><br>' + d.answer.replace(/\\\\n/g,'<br>') + '</div>';
+    let html = '<div class="answer"><span class="bank-label '+currentBank+'">'+bankName+'</span><br>' + d.answer.replace(/\\\\\\n/g,'<br>') + '</div>';
     if (d.sources && d.sources.length) {
       html += '<div class="sources"><strong>📎 参考来源</strong></div>';
       d.sources.forEach((s, idx) => {
         const docId = s.doc_id || '';
-        const viewLink = docId ? ` <a href="javascript:viewDocContent('${docId}','${s.doc.replace(/'/g,"\\\\'")}')" style="color:#e94560;font-size:11px">📖 查看原文</a>` : '';
+        const viewLink = docId ? ` <a href="javascript:viewDocContent('${docId}','${s.doc.replace(/'/g,"\\\\'")}'" style="color:#e94560;font-size:11px">📖 查看原文</a>` : '';
         html += `<div class="source" id="src-${idx}">
           <div class="doc">${s.doc} · ${s.chunk}${viewLink}</div>
           <div class="text">${s.text}</div>
@@ -2284,23 +2284,8 @@ async function doSearch() {
         </div>`;
       });
     }
-    // Follow-up input section
-    if (conversationHistory.length >= 1) {
-      html += '<div style="margin-top:14px;padding:12px 16px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)">';
-      html += '<div style="font-size:12px;color:#888;margin-bottom:8px;cursor:pointer" onclick="toggleHistory()">💬 对话历史 (' + conversationHistory.length + ' 轮) ▸</div>';
-      html += '<div id="history-thread" style="display:none;margin-bottom:10px;max-height:200px;overflow-y:auto;font-size:12px">';
-      conversationHistory.forEach((h, i) => {
-        html += '<div style="margin-bottom:8px"><div style="color:#e94560;font-weight:600">🙋 第' + (i+1) + '轮</div>';
-        html += '<div style="color:#333;margin:2px 0">Q: ' + h.q + '</div>';
-        html += '<div style="color:#666">A: ' + h.a.substring(0,150) + '...</div></div>';
-      });
-      html += '</div>';
-      html += '<div style="display:flex;gap:8px">';
-      html += '<input id="follow-up-input" placeholder="追问..." style="flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none" onkeydown="if(event.key===\\'Enter\\')doFollowUp()">';
-      html += '<button onclick="doFollowUp()" style="padding:10px 18px;background:#4a90d9;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">💬 追问</button>';
-      html += '<button onclick="clearConversation()" style="padding:10px 14px;background:#eee;color:#888;border:none;border-radius:8px;font-size:12px;cursor:pointer">清除</button>';
-      html += '</div></div>';
-    }
+    // 联网搜索按钮
+    html += '<div style="margin-top:12px;text-align:center"><button onclick="doWebSearch()" style="padding:8px 20px;background:#f0f0f0;color:#555;border:1px solid #ddd;border-radius:8px;font-size:13px;cursor:pointer">🌐 联网搜索</button></div>';
     area.innerHTML = html;
   } catch(e) {
     area.innerHTML = '<div class="result-msg error">搜索失败: '+e.message+'</div>';
@@ -2491,89 +2476,41 @@ async function loadRagEval() {
   }
 }
 
-function toggleHistory() {
-  const thread = document.getElementById('history-thread');
-  if (thread) {
-    thread.style.display = thread.style.display === 'none' ? 'block' : 'none';
-  }
-}
-
-async function doFollowUp() {
-  const input = document.getElementById('follow-up-input');
-  if (!input) return;
-  const q = input.value.trim();
+async function doWebSearch() {
+  const q = document.getElementById('query').value.trim();
   if (!q) return;
-  input.value = '';
-
-  // 收集当前页面上下文：答案区的完整文本
-  const answerArea = document.getElementById('answer-area');
-  const pageContext = answerArea ? answerArea.innerText : '';
-
-  // 构建对话历史
-  const NL = String.fromCharCode(10);
-  let histText = '';
-  if (conversationHistory.length > 0) {
-    histText = conversationHistory.map(h => '问：' + h.q + NL + '答：' + h.a).join(NL + NL);
-  }
-
+  const area = document.getElementById('answer-area');
+  
+  // 收集当前页面上下文
+  const pageContext = area ? area.innerText : '';
+  
   // 显示 loading
   const loadingDiv = document.createElement('div');
   loadingDiv.className = 'loading';
-  loadingDiv.innerHTML = '<span class="spin"></span> 思考中...';
-  answerArea.appendChild(loadingDiv);
-
+  loadingDiv.innerHTML = '<span class="spin"></span> 联网搜索中...';
+  area.appendChild(loadingDiv);
+  
   try {
     const fd = new FormData();
     fd.append('q', q);
     fd.append('bank', currentBank);
     fd.append('context', pageContext.substring(0, 4000));
-    fd.append('history', histText);
-
-    const r = await fetch('/api/follow-up', {method: 'POST', body: fd});
+    
+    const r = await fetch('/api/web-search', {method: 'POST', body: fd});
     const d = await r.json();
-
-    // 移除 loading
+    
     loadingDiv.remove();
-
-    // 存入对话历史
-    conversationHistory.push({q: q, a: d.answer});
-    if (conversationHistory.length > 5) conversationHistory.shift();
-
-    // 追加显示追问回答
-    let html = '<div class="answer" style="border-left:3px solid #4a90d9;margin-top:12px">';
-    html += '<span class="bank-label ' + currentBank + '">💬 追问</span><br>';
-    html += d.answer.replace(/\\\\n/g, '<br>');
+    
+    let html = '<div class="answer" style="border-left:3px solid #4CAF50;margin-top:12px">';
+    html += '<span style="display:inline-block;padding:2px 8px;background:#e8f5e9;color:#2e7d32;border-radius:4px;font-size:12px;font-weight:600;margin-bottom:6px">🌐 联网搜索</span><br>';
+    html += d.answer.replace(/\\\\\\n/g, '<br>');
     html += '</div>';
-
-    // 更新追问区域
-    html += '<div style="margin-top:14px;padding:12px 16px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)">';
-    html += '<div style="font-size:12px;color:#888;margin-bottom:8px;cursor:pointer" onclick="toggleHistory()">💬 对话历史 (' + conversationHistory.length + ' 轮) ▸</div>';
-    html += '<div id="history-thread" style="display:none;margin-bottom:10px;max-height:200px;overflow-y:auto;font-size:12px">';
-    conversationHistory.forEach((h, i) => {
-      html += '<div style="margin-bottom:8px"><div style="color:#e94560;font-weight:600">第' + (i+1) + '轮</div>';
-      html += '<div style="color:#333;margin:2px 0">Q: ' + h.q + '</div>';
-      html += '<div style="color:#666">A: ' + h.a.substring(0,150) + '...</div></div>';
-    });
-    html += '</div>';
-    html += '<div style="display:flex;gap:8px">';
-    html += '<input id="follow-up-input" placeholder="继续追问..." style="flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none" onkeydown="if(event.key===\\'Enter\\')doFollowUp()">';
-    html += '<button onclick="doFollowUp()" style="padding:10px 18px;background:#4a90d9;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">💬 追问</button>';
-    html += '<button onclick="clearConversation()" style="padding:10px 14px;background:#eee;color:#888;border:none;border-radius:8px;font-size:12px;cursor:pointer">清除</button>';
-    html += '</div></div>';
-
-    answerArea.innerHTML += html;
-
+    
+    area.innerHTML += html;
   } catch(e) {
     loadingDiv.remove();
-    answerArea.innerHTML += '<div class="result-msg error">追问失败: ' + e.message + '</div>';
+    area.innerHTML += '<div class="result-msg error">联网搜索失败: ' + e.message + '</div>';
   }
-}
-
-function clearConversation() {
-  conversationHistory = [];
-  document.getElementById('answer-area').innerHTML = '';
-  document.getElementById('query').value = '';
-  document.getElementById('query').focus();
 }
 
 async function doFetchStandard() {
